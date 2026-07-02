@@ -6,13 +6,14 @@
   - X轴缩放/平移时所有通道同步
   - 只显示当前选中通道的Y轴, 其他通道曲线可见但无Y轴
   - 游标卡尺功能(双竖线测量)
-  - 使用环形缓冲区实现高性能实时刷新
-  - 右键框选放大: 按住右键拖拽矩形, 松开放大到选区
+  - 使用可增长缓存和视野抽样实现高性能实时刷新
+  - 左键框选放大: 按住左键拖拽矩形, 松开放大到选区
 """
+import math
+
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from collections import deque
 
 
 class TimeAxisItem(pg.AxisItem):
@@ -59,6 +60,11 @@ class TimeAxisItem(pg.AxisItem):
             if span_ms <= 0:
                 span_ms = spacing
 
+        if self._last_unit != 'compound':
+            self._last_unit = 'compound'
+            self.setLabel(text='鏃堕棿', units='', **self._label_style)
+        return [self.format_time_ms(v) for v in values]
+
         factor, unit = self.best_unit(span_ms)
         # 单位变化时更新标签 (仅在变化时触发, 避免无限重绘)
         if unit != self._last_unit:
@@ -66,21 +72,49 @@ class TimeAxisItem(pg.AxisItem):
             self.setLabel(text='时间', units=unit, **self._label_style)
         return [f'{v / factor:.4g}' for v in values]
 
+    @classmethod
+    def format_time_ms(cls, value_ms, max_parts=2):
+        sign = '-' if value_ms < 0 else ''
+        total_us = int(round(abs(float(value_ms)) * 1000.0))
+        if total_us == 0:
+            return '0'
+
+        units = [
+            (3600_000_000, 'h'),
+            (60_000_000, 'min'),
+            (1_000_000, 's'),
+            (1000, 'ms'),
+            (1, 'us'),
+        ]
+        parts = []
+        remaining = total_us
+        for unit_us, suffix in units:
+            value, remaining = divmod(remaining, unit_us)
+            if value:
+                parts.append(f'{value}{suffix}')
+                if len(parts) >= max_parts:
+                    break
+        return sign + ''.join(parts)
+
 
 class ZoomViewBox(pg.ViewBox):
-    """支持右键框选放大的 ViewBox"""
+    """支持左键框选放大的 ViewBox"""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setMouseMode(self.PanMode)
-        self.setMenuEnabled(False)  # 禁用右键菜单, 右键用于框选放大
+        self.setMenuEnabled(False)  # 禁用右键菜单, 左键用于框选放大
         self._zooming = False
         self._zooming = False
         self._zoom_start = None
         self._rubber_band = None
         self._glw_ref = None
+        self._click_callback = None
         self._zoom_exclusion_lines = []
         self._zoom_line_hit_px = 8
+
+    def set_click_callback(self, callback):
+        self._click_callback = callback
 
     def set_zoom_exclusion_lines(self, lines):
         self._zoom_exclusion_lines = list(lines or [])
@@ -96,7 +130,7 @@ class ZoomViewBox(pg.ViewBox):
         glw.viewport().installEventFilter(self)
 
     def eventFilter(self, obj, event):
-        """拦截鼠标事件, 实现右键框选放大"""
+        """拦截鼠标事件, 实现左键框选放大"""
         if self._rubber_band is None:
             return False
 
@@ -127,10 +161,27 @@ class ZoomViewBox(pg.ViewBox):
             if self._zooming and event.button() == QtCore.Qt.LeftButton:
                 self._zooming = False
                 self._rubber_band.hide()
-                self._apply_zoom(event.pos())
+                if self._is_click(event.pos()):
+                    self._handle_click(event.pos())
+                else:
+                    self._apply_zoom(event.pos())
                 return True
 
         return False
+
+    def _is_click(self, end_pos):
+        if self._zoom_start is None:
+            return False
+        delta = end_pos - self._zoom_start
+        return abs(delta.x()) < 5 and abs(delta.y()) < 5
+
+    def _handle_click(self, pos):
+        if self._click_callback is None:
+            return
+        scene_pos = self._viewport_to_scene(pos)
+        if scene_pos is None or not self.sceneBoundingRect().contains(scene_pos):
+            return
+        self._click_callback(scene_pos, pos)
 
     def _viewport_to_scene(self, pos):
         if self._glw_ref is None:
@@ -220,6 +271,7 @@ class CursorStatsDialog(QtWidgets.QDialog):
     """Floating cursor measurement table."""
 
     lock_changed = QtCore.pyqtSignal(bool)
+    floating_values_changed = QtCore.pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -276,6 +328,11 @@ class CursorStatsDialog(QtWidgets.QDialog):
         self._chk_lock = QtWidgets.QCheckBox("锁定 C1-C2 间距")
         self._chk_lock.toggled.connect(self.lock_changed)
         top.addWidget(self._chk_lock, 1, 0, 1, 3)
+        self._chk_floating_values = QtWidgets.QCheckBox("显示悬浮读数")
+        self._chk_floating_values.setChecked(True)
+        self._chk_floating_values.toggled.connect(
+            self.floating_values_changed)
+        top.addWidget(self._chk_floating_values, 2, 0, 1, 3)
         layout.addLayout(top)
 
         self._table = QtWidgets.QTableWidget(0, 6)
@@ -321,6 +378,11 @@ class CursorStatsDialog(QtWidgets.QDialog):
         self._chk_lock.setChecked(bool(checked))
         self._chk_lock.blockSignals(False)
 
+    def set_floating_values_checked(self, checked):
+        self._chk_floating_values.blockSignals(True)
+        self._chk_floating_values.setChecked(bool(checked))
+        self._chk_floating_values.blockSignals(False)
+
 
 class MultiChannelWaveform(QtWidgets.QWidget):
     """多通道波形显示组件"""
@@ -338,8 +400,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._selected_channel = 0
         self._sample_interval_ms = 1.0  # 每帧间隔(ms), 默认1ms
 
-        self._buffers = [deque(maxlen=max_points)
-                         for _ in range(num_channels)]
+        self._buffers = [[] for _ in range(num_channels)]
         self._time_counter = 0
 
         self._channel_configs = []
@@ -364,12 +425,20 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._cursor1 = None
         self._cursor2 = None
         self._cursor_dialog = None
+        self._cursor_value_labels = [None, None]
+        self._cursor_floating_values_enabled = True
         self._cursor_anchor_ratios = [0.4, 0.6]
         self._cursor_syncing = False
         self._cursor_lock_enabled = False
         self._cursor_pair_delta = 0.0
+        self._trigger_marker_line = None
+        self._trigger_marker_label = None
+        self._trigger_marker_sample_index = None
         self._dirty = False
         self._needs_initial_range = True
+        self._auto_x_range_update = False
+        self._follow_latest_x = True
+        self._channel_click_hit_px = 16.0
 
         self._setup_ui()
 
@@ -461,7 +530,8 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         left_axis = self._plot_item.getAxis('left')
         bottom_axis = self._plot_item.getAxis('bottom')
         left_axis.setPen(hidden_axis_pen)
-        left_axis.setWidth(58)
+        left_axis.setWidth(96)
+        left_axis.setStyle(tickTextOffset=2, tickTextWidth=52)
         bottom_axis.setPen(hidden_axis_pen)
         bottom_axis.setHeight(46)
         bottom_axis.setStyle(tickTextOffset=8)
@@ -497,6 +567,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         pl.setSpacing(0)
 
         vb.setGLW(self._glw)
+        vb.set_click_callback(self._select_channel_from_scene_click)
         self._right_axis = self._plot_item.getAxis('right')
 
         # 绑定 GLW 到 ViewBox, 启用框选放大
@@ -838,6 +909,108 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             vb.setGeometry(rect)
             vb.linkedViewChanged(self._main_view_box, vb.XAxis)
 
+    def _select_channel_from_scene_click(self, scene_pos, viewport_pos=None):
+        if self._main_view_box is None:
+            return
+        if not self._main_view_box.sceneBoundingRect().contains(scene_pos):
+            return
+
+        x_ms = self._main_view_box.mapSceneToView(scene_pos).x()
+        x_tolerance = self._click_x_tolerance_ms(viewport_pos)
+        best_ch = None
+        best_distance = float('inf')
+
+        for ch in range(self._active_channel_count):
+            if not self._channel_configs[ch]['visible']:
+                continue
+            distance = self._curve_click_distance_px(
+                ch, scene_pos, x_ms, x_tolerance)
+            if distance is not None and distance < best_distance:
+                best_ch = ch
+                best_distance = distance
+
+        if best_ch is not None and best_distance <= self._channel_click_hit_px:
+            self.select_channel(best_ch)
+
+    def _click_x_tolerance_ms(self, viewport_pos):
+        pixel_radius = 8
+        if viewport_pos is not None and self._glw is not None:
+            y = viewport_pos.y()
+            left_scene = self._glw.mapToScene(
+                QtCore.QPoint(viewport_pos.x() - pixel_radius, y))
+            right_scene = self._glw.mapToScene(
+                QtCore.QPoint(viewport_pos.x() + pixel_radius, y))
+            left_x = self._main_view_box.mapSceneToView(left_scene).x()
+            right_x = self._main_view_box.mapSceneToView(right_scene).x()
+            return max(abs(right_x - left_x) * 0.5,
+                       self._sample_interval_ms)
+
+        x_min, x_max = self._main_view_box.viewRange()[0]
+        rect = self._main_view_box.sceneBoundingRect()
+        width = max(float(rect.width()), 1.0)
+        return max(abs(x_max - x_min) / width * pixel_radius,
+                   self._sample_interval_ms)
+
+    def _curve_click_distance_px(self, ch, scene_pos, x_ms, x_tolerance):
+        x_data, y_data = self._curves[ch].getData()
+        if x_data is None or y_data is None:
+            return None
+
+        x_arr = np.asarray(x_data, dtype=np.float64)
+        y_arr = np.asarray(y_data, dtype=np.float64)
+        count = min(len(x_arr), len(y_arr))
+        if count <= 0:
+            return None
+        if len(x_arr) != count:
+            x_arr = x_arr[:count]
+        if len(y_arr) != count:
+            y_arr = y_arr[:count]
+
+        left = int(np.searchsorted(
+            x_arr, x_ms - x_tolerance, side='left'))
+        right = int(np.searchsorted(
+            x_arr, x_ms + x_tolerance, side='right'))
+        start = max(0, left - 1)
+        end = min(count - 1, right)
+        if start > end:
+            nearest = int(np.argmin(np.abs(x_arr - x_ms)))
+            start = max(0, nearest - 1)
+            end = min(count - 1, nearest + 1)
+
+        owner_vb = self._curve_view_boxes[ch]
+        best = float('inf')
+        for idx in range(start, end + 1):
+            point = owner_vb.mapViewToScene(
+                QtCore.QPointF(float(x_arr[idx]), float(y_arr[idx])))
+            best = min(best, self._point_distance_px(scene_pos, point))
+            if idx < end:
+                next_point = owner_vb.mapViewToScene(
+                    QtCore.QPointF(float(x_arr[idx + 1]),
+                                   float(y_arr[idx + 1])))
+                best = min(best, self._point_to_segment_distance_px(
+                    scene_pos, point, next_point))
+        return best
+
+    @staticmethod
+    def _point_distance_px(a, b):
+        return math.hypot(a.x() - b.x(), a.y() - b.y())
+
+    @staticmethod
+    def _point_to_segment_distance_px(point, start, end):
+        px, py = point.x(), point.y()
+        x1, y1 = start.x(), start.y()
+        x2, y2 = end.x(), end.y()
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0:
+            return math.hypot(px - x1, py - y1)
+        t = ((px - x1) * dx + (py - y1) * dy) / length_sq
+        t = max(0.0, min(1.0, t))
+        nearest_x = x1 + t * dx
+        nearest_y = y1 + t * dy
+        return math.hypot(px - nearest_x, py - nearest_y)
+
     def _move_curve_to_view_box(self, ch, target_vb):
         curve = self._curves[ch]
         current_vb = self._curve_view_boxes[ch]
@@ -909,6 +1082,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._combo_y_ch.blockSignals(True)
         self._combo_y_ch.setCurrentIndex(ch)
         self._combo_y_ch.blockSignals(False)
+        self._update_trigger_marker_position()
 
     # ─── 数据输入 ─────────────────────────────────────────────
 
@@ -932,6 +1106,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         if self._paused or not frames:
             return
 
+        self._ensure_buffer_capacity(self._time_counter + len(frames))
         active_count = min(max(len(values) for values in frames),
                            self._num_channels)
         self.set_active_channel_count(active_count)
@@ -953,6 +1128,16 @@ class MultiChannelWaveform(QtWidgets.QWidget):
                 self._expand_y_range_for_minmax(
                     i, batch_min[i], batch_max[i])
         self._dirty = True
+
+    def _ensure_buffer_capacity(self, needed_points):
+        if needed_points <= self._max_points:
+            return
+
+        grow_step = max(1000, self._max_points // 2)
+        new_max = max(needed_points, self._max_points + grow_step)
+        new_max = int(math.ceil(new_max / 1000.0) * 1000)
+        self.set_max_points(new_max)
+        self.buffer_size_changed.emit(new_max)
 
     def _expand_y_range_for_minmax(self, ch, value_min, value_max):
         y_range = self._channel_y_ranges[ch]
@@ -1000,7 +1185,14 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._refresh_curves()
 
     def _refresh_curves(self):
-        has_data = False
+        has_data = any(
+            i < self._active_channel_count and
+            self._channel_configs[i]['visible'] and
+            len(self._buffers[i]) > 0
+            for i in range(self._num_channels))
+        if has_data and not self._paused and self._follow_latest_x:
+            self._set_latest_x_range()
+
         for i in range(self._num_channels):
             if i >= self._active_channel_count:
                 self._curves[i].setData([], [])
@@ -1012,28 +1204,82 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             if len(buf) == 0:
                 self._curves[i].setData([], [])
                 continue
-            has_data = True
-            y = np.fromiter(buf, dtype=np.float64)
-            x = np.arange(len(y)) * self._sample_interval_ms
+            x, y = self._curve_data_for_buffer(buf)
             self._curves[i].setData(x, y)
 
         if has_data and self._needs_initial_range:
             self._auto_range_all_channels()
             self._needs_initial_range = False
         if has_data:
-            self._set_latest_x_range()
             self._update_cursor_info()
+            self._update_trigger_marker_position()
 
     def _set_initial_x_range(self):
         self._set_latest_x_range()
 
     def _set_latest_x_range(self):
-        max_len = max((len(buf) for buf in self._buffers), default=0)
-        if max_len <= 1:
+        if self._time_counter <= 1:
             return
-        x_max = (max_len - 1) * self._sample_interval_ms
+        x_max = (self._time_counter - 1) * self._sample_interval_ms
         x_min = max(0, x_max - (self._max_points - 1) * self._sample_interval_ms)
-        self._main_view_box.setXRange(x_min, x_max, padding=0)
+        self._auto_x_range_update = True
+        try:
+            self._main_view_box.setXRange(x_min, x_max, padding=0)
+        finally:
+            self._auto_x_range_update = False
+
+    def _buffer_start_sample_index(self, buf):
+        return max(0, self._time_counter - len(buf))
+
+    def _curve_data_for_buffer(self, buf):
+        start_index, end_index = self._visible_sample_bounds(buf)
+        if end_index < start_index:
+            empty = np.array([], dtype=np.float64)
+            return empty, empty
+
+        count = end_index - start_index + 1
+        buf_start = self._buffer_start_sample_index(buf)
+        offset = start_index - buf_start
+        budget = self._curve_point_budget()
+
+        if count <= budget:
+            y = np.asarray(buf[offset:offset + count], dtype=np.float64)
+            x = (np.arange(start_index, start_index + count,
+                           dtype=np.float64) * self._sample_interval_ms)
+            return x, y
+
+        step = max(1, int(math.ceil(count / float(budget))))
+        indices = list(range(start_index, end_index + 1, step))
+        if indices[-1] != end_index:
+            indices.append(end_index)
+
+        y = np.asarray([buf[i - buf_start] for i in indices],
+                       dtype=np.float64)
+        x = (np.asarray(indices, dtype=np.float64) *
+             self._sample_interval_ms)
+        return x, y
+
+    def _visible_sample_bounds(self, buf):
+        buf_start = self._buffer_start_sample_index(buf)
+        buf_end = buf_start + len(buf) - 1
+        if self._needs_initial_range or self._main_view_box is None:
+            return buf_start, buf_end
+
+        x_min, x_max = self._main_view_box.viewRange()[0]
+        if x_max <= x_min or self._sample_interval_ms <= 0:
+            return buf_start, buf_end
+
+        view_start = int(math.floor(x_min / self._sample_interval_ms)) - 1
+        view_end = int(math.ceil(x_max / self._sample_interval_ms)) + 1
+        return max(buf_start, view_start), min(buf_end, view_end)
+
+    def _curve_point_budget(self):
+        width = 1000.0
+        if self._main_view_box is not None:
+            rect = self._main_view_box.sceneBoundingRect()
+            if rect.width() > 1:
+                width = float(rect.width()) * self._effective_device_pixel_ratio()
+        return max(2000, min(20000, int(width * 4)))
 
     def _on_x_range_changed(self, viewbox, range_info):
         """X轴范围变化时, 自动调整缓冲点数"""
@@ -1041,12 +1287,13 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         visible_range_ms = x_max - x_min
         if visible_range_ms <= 0 or self._sample_interval_ms <= 0:
             return
-        # 需要的点数 = 可见时间范围 / 每帧间隔, 留20%余量
-        required = int(visible_range_ms / self._sample_interval_ms) + 2
-        required = max(required, 1000)
-        if required > self._max_points:
-            self.set_max_points(required)
-            self.buffer_size_changed.emit(required)
+        if not self._auto_x_range_update:
+            samples_visible = visible_range_ms / self._sample_interval_ms + 1.0
+            required = max(1, int(np.ceil(samples_visible - 1e-9)))
+            if required > self._max_points:
+                self.set_max_points(required)
+                self.buffer_size_changed.emit(required)
+            self._dirty = True
         self._apply_cursor_anchor_ratios(x_min, x_max)
 
     # ─── 通道配置 ─────────────────────────────────────────────
@@ -1165,6 +1412,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
 
         self._plot_item.addItem(self._cursor1)
         self._plot_item.addItem(self._cursor2)
+        self._create_cursor_value_labels()
         vb = self._plot_item.getViewBox()
         if hasattr(vb, 'set_zoom_exclusion_lines'):
             vb.set_zoom_exclusion_lines([self._cursor1, self._cursor2])
@@ -1187,6 +1435,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         if self._cursor2:
             self._plot_item.removeItem(self._cursor2)
             self._cursor2 = None
+        self._remove_cursor_value_labels()
         if self._cursor_dialog:
             self._cursor_dialog.hide()
         self._info_label.setText("")
@@ -1196,10 +1445,47 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             self._cursor_dialog = CursorStatsDialog(self.window())
             self._cursor_dialog.lock_changed.connect(
                 self._on_cursor_lock_changed)
+            self._cursor_dialog.floating_values_changed.connect(
+                self._on_cursor_floating_values_changed)
         self._cursor_dialog.set_lock_checked(self._cursor_lock_enabled)
+        self._cursor_dialog.set_floating_values_checked(
+            self._cursor_floating_values_enabled)
         self._cursor_dialog.show()
         self._cursor_dialog.raise_()
         self._cursor_dialog.activateWindow()
+
+    def _create_cursor_value_labels(self):
+        self._remove_cursor_value_labels()
+        for idx, title in enumerate(('C1', 'C2')):
+            label = pg.TextItem(
+                html=f"<b>{title}</b>",
+                anchor=(0, 0),
+                border=pg.mkPen('#888888'),
+                fill=pg.mkBrush(30, 30, 30, 220))
+            label.setZValue(1000)
+            self._plot_item.addItem(label)
+            self._cursor_value_labels[idx] = label
+        self._set_cursor_value_labels_visible(
+            self._cursor_floating_values_enabled)
+
+    def _remove_cursor_value_labels(self):
+        for idx, label in enumerate(self._cursor_value_labels):
+            if label is not None:
+                try:
+                    self._plot_item.removeItem(label)
+                except (TypeError, RuntimeError):
+                    pass
+            self._cursor_value_labels[idx] = None
+
+    def _set_cursor_value_labels_visible(self, visible):
+        for label in self._cursor_value_labels:
+            if label is not None:
+                label.setVisible(bool(visible))
+
+    def _on_cursor_floating_values_changed(self, checked):
+        self._cursor_floating_values_enabled = bool(checked)
+        self._set_cursor_value_labels_visible(checked)
+        self._update_cursor_info()
 
     def _on_cursor_lock_changed(self, checked):
         self._cursor_lock_enabled = bool(checked)
@@ -1239,9 +1525,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         t1 = self._cursor1.value()
         t2 = self._cursor2.value()
         dt = abs(t2 - t1)
-        # 时间值转换为样本索引
-        idx1 = int(t1 / self._sample_interval_ms)
-        idx2 = int(t2 / self._sample_interval_ms)
+        # 时间值转换为全局样本索引
+        sample_idx1 = int(t1 / self._sample_interval_ms)
+        sample_idx2 = int(t2 / self._sample_interval_ms)
 
         # 动态选择与X轴一致的单位
         max_t = max(abs(t1), abs(t2), 1)
@@ -1252,7 +1538,8 @@ class MultiChannelWaveform(QtWidgets.QWidget):
                 break
 
         def _fmt(ms):
-            return f'{ms / factor:.3g}'
+            return TimeAxisItem.format_time_ms(ms)
+        unit = ''
 
         info_parts = [
             f"<b>游标卡尺</b> | ΔT = {_fmt(dt)}{unit} | "
@@ -1268,6 +1555,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             if len(buf) == 0:
                 continue
 
+            buf_start = self._buffer_start_sample_index(buf)
+            idx1 = sample_idx1 - buf_start
+            idx2 = sample_idx2 - buf_start
             v1 = self._get_value_at(buf, idx1)
             v2 = self._get_value_at(buf, idx2)
             dv = ((v2 - v1) if v1 is not None and v2 is not None
@@ -1308,6 +1598,50 @@ class MultiChannelWaveform(QtWidgets.QWidget):
                 f"{_fmt(t2)}{unit}",
                 f"{_fmt(dt)}{unit}",
                 dialog_rows)
+        self._update_cursor_value_labels(t1, t2, dialog_rows)
+
+    def _update_cursor_value_labels(self, t1, t2, rows):
+        if not self._cursor_floating_values_enabled:
+            self._set_cursor_value_labels_visible(False)
+            return
+        if not self._cursor1 or not self._cursor2:
+            return
+
+        values = [
+            ('C1', t1, 'c1', self._cursor_value_labels[0], (0, 0)),
+            ('C2', t2, 'c2', self._cursor_value_labels[1], (1, 0)),
+        ]
+        y_pos = self._cursor_value_label_y()
+        for title, t_value, key, label, anchor in values:
+            if label is None:
+                continue
+            label.setHtml(self._cursor_value_label_html(title, t_value, rows, key))
+            if hasattr(label, 'setAnchor'):
+                label.setAnchor(anchor)
+            label.setPos(t_value, y_pos)
+            label.setVisible(True)
+
+    def _cursor_value_label_y(self):
+        if self._main_view_box is None:
+            return 0.0
+        y_min, y_max = self._main_view_box.viewRange()[1]
+        span = y_max - y_min
+        if span <= 0:
+            return y_max
+        return y_max - span * 0.04
+
+    def _cursor_value_label_html(self, title, t_value, rows, value_key):
+        lines = [
+            "<div style='font-family:Consolas; font-size:11pt; "
+            "color:#E6E6E6;'>"
+            f"<b>{title}</b> @ {TimeAxisItem.format_time_ms(t_value)}"
+        ]
+        for row in rows:
+            lines.append(
+                f"<br><span style='color:{row['color']}'>{row['name']}</span>: "
+                f"{row[value_key]}")
+        lines.append("</div>")
+        return ''.join(lines)
 
     @staticmethod
     def _format_measurement(value, suffix=""):
@@ -1346,6 +1680,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._btn_pause.setText("继续" if paused else "暂停")
 
     def clear_data(self):
+        self.clear_trigger_marker()
         for buf in self._buffers:
             buf.clear()
         self._time_counter = 0
@@ -1401,14 +1736,63 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._auto_range_all_channels()
 
     def set_max_points(self, n):
-        self._max_points = n
-        for i in range(self._num_channels):
-            old_buf = self._buffers[i]
-            new_buf = deque(maxlen=n)
-            start = max(0, len(old_buf) - n)
-            for j in range(start, len(old_buf)):
-                new_buf.append(old_buf[j])
-            self._buffers[i] = new_buf
+        self._max_points = max(1, int(n))
+        for buf in self._buffers:
+            overflow = len(buf) - self._max_points
+            if overflow > 0:
+                del buf[:overflow]
+        self._dirty = True
+
+    def set_follow_latest_enabled(self, enabled):
+        self._follow_latest_x = bool(enabled)
+        self._dirty = True
+
+    def set_trigger_marker_sample_index(self, sample_index):
+        self.clear_trigger_marker()
+        try:
+            sample_index = int(sample_index)
+        except (TypeError, ValueError):
+            return
+        if sample_index < 0:
+            return
+
+        self._trigger_marker_sample_index = sample_index
+        x_pos = sample_index * self._sample_interval_ms
+        pen = pg.mkPen('#FFD166', width=2, style=QtCore.Qt.DashLine)
+        self._trigger_marker_line = pg.InfiniteLine(
+            pos=x_pos, angle=90, movable=False, pen=pen)
+        self._trigger_marker_line.setZValue(900)
+        self._plot_item.addItem(self._trigger_marker_line)
+
+        self._trigger_marker_label = pg.TextItem(
+            html="<span style='color:#FFD166; font-weight:bold;'>▼ 触发点</span>",
+            anchor=(0.5, 1),
+            border=pg.mkPen('#FFD166'),
+            fill=pg.mkBrush(30, 30, 30, 220))
+        self._trigger_marker_label.setZValue(1001)
+        self._plot_item.addItem(self._trigger_marker_label)
+        self._update_trigger_marker_position()
+
+    def clear_trigger_marker(self):
+        for item_name in ('_trigger_marker_line', '_trigger_marker_label'):
+            item = getattr(self, item_name)
+            if item is not None:
+                try:
+                    self._plot_item.removeItem(item)
+                except (TypeError, RuntimeError):
+                    pass
+                setattr(self, item_name, None)
+        self._trigger_marker_sample_index = None
+
+    def _update_trigger_marker_position(self):
+        if self._trigger_marker_sample_index is None:
+            return
+        x_pos = self._trigger_marker_sample_index * self._sample_interval_ms
+        if self._trigger_marker_line is not None:
+            self._trigger_marker_line.setValue(x_pos)
+        if self._trigger_marker_label is not None and self._main_view_box is not None:
+            y_min, y_max = self._main_view_box.viewRange()[1]
+            self._trigger_marker_label.setPos(x_pos, y_max)
 
     def set_sample_interval_ms(self, interval_ms):
         """设置每帧数据的时间间隔(ms), 用于将样本索引转换为时间"""
@@ -1416,6 +1800,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._update_sample_rate_label()
         self._time_axis.picture = None
         self._time_axis.update()
+        self._update_trigger_marker_position()
 
     def _update_sample_rate_label(self):
         if not hasattr(self, '_lbl_sample_rate'):

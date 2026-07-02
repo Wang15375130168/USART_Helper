@@ -3,11 +3,14 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QComboBox, QPushButton,
     QStatusBar, QSplitter, QTextEdit, QCheckBox,
-    QLineEdit, QSpinBox, QDoubleSpinBox, QTabWidget, QMessageBox, QSizePolicy
+    QLineEdit, QSpinBox, QDoubleSpinBox, QTabWidget, QMessageBox, QSizePolicy,
+    QDialog
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QTextCursor
+import math
 import time
+from collections import deque
 from datetime import datetime
 
 from serial_handler import SerialHandler
@@ -50,6 +53,15 @@ class MainWindow(QMainWindow):
         self._rx_display_used = 0
         self._rx_display_dropped = 0
         self._rx_display_window_start = time.time()
+        self._trigger_armed = False
+        self._trigger_capturing = False
+        self._trigger_pre_buffer = deque()
+        self._trigger_capture_frames = []
+        self._trigger_prev_value = None
+        self._trigger_total_samples = 0
+        self._trigger_pre_samples = 0
+        self._trigger_sample_index = None
+        self._trigger_wait_dialog = None
 
         self._setup_ui()
         self._connect_signals()
@@ -159,9 +171,12 @@ class MainWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        self._right_splitter = QSplitter(Qt.Vertical)
+        self._right_splitter.setChildrenCollapsible(False)
+        right_layout.addWidget(self._right_splitter, 1)
 
         self._channel_config = ChannelConfigPanel(num_channels=10)
-        right_layout.addWidget(self._channel_config)
+        self._right_splitter.addWidget(self._channel_config)
 
         # 协议配置
         proto_group = QGroupBox("数据协议")
@@ -205,22 +220,98 @@ class MainWindow(QMainWindow):
             "Data parsed by channel Type; X axis uses configured period")
         info_label.setStyleSheet("color: #888888; font-size: 12px;")
         proto_layout.addWidget(info_label)
-        right_layout.addWidget(proto_group)
+        self._make_group_collapsible(proto_group)
+        self._right_splitter.addWidget(proto_group)
 
         # 缓冲区大小
-        buf_group = QGroupBox("显示设置")
-        buf_layout = QHBoxLayout(buf_group)
+        buf_layout = QHBoxLayout()
         buf_layout.addWidget(QLabel("缓冲点数:"))
         self._spin_bufsize = QSpinBox()
-        self._spin_bufsize.setRange(100, 100000)
+        self._spin_bufsize.setRange(100, 1000000)
         self._spin_bufsize.setValue(5000)
         self._spin_bufsize.setSingleStep(1000)
         self._spin_bufsize.valueChanged.connect(
             self._waveform.set_max_points)
         buf_layout.addWidget(self._spin_bufsize)
         buf_layout.addStretch()
-        right_layout.addWidget(buf_group)
-        right_layout.addStretch()
+        proto_layout.addLayout(buf_layout)
+
+        trigger_group = QGroupBox("触发采样")
+        trigger_layout = QVBoxLayout(trigger_group)
+        trigger_layout.setSpacing(4)
+
+        trigger_top = QHBoxLayout()
+        self._chk_trigger_enable = QCheckBox("启用触发")
+        trigger_top.addWidget(self._chk_trigger_enable)
+        self._btn_trigger_arm = QPushButton("重新触发")
+        self._btn_trigger_arm.setEnabled(False)
+        trigger_top.addWidget(self._btn_trigger_arm)
+        trigger_top.addStretch()
+        trigger_layout.addLayout(trigger_top)
+
+        trigger_row1 = QHBoxLayout()
+        trigger_row1.addWidget(QLabel("触发源:"))
+        self._combo_trigger_channel = QComboBox()
+        self._combo_trigger_channel.setMaximumWidth(110)
+        trigger_row1.addWidget(self._combo_trigger_channel)
+        trigger_row1.addWidget(QLabel("模式:"))
+        self._combo_trigger_mode = QComboBox()
+        self._combo_trigger_mode.addItem("上升沿", "rising")
+        self._combo_trigger_mode.addItem("下降沿", "falling")
+        self._combo_trigger_mode.addItem("电平", "level")
+        self._combo_trigger_mode.setMaximumWidth(90)
+        trigger_row1.addWidget(self._combo_trigger_mode)
+        trigger_row1.addStretch()
+        trigger_layout.addLayout(trigger_row1)
+
+        trigger_row2 = QHBoxLayout()
+        trigger_row2.addWidget(QLabel("阈值:"))
+        self._spin_trigger_threshold = QDoubleSpinBox()
+        self._spin_trigger_threshold.setRange(-1e12, 1e12)
+        self._spin_trigger_threshold.setDecimals(6)
+        self._spin_trigger_threshold.setSingleStep(1.0)
+        self._spin_trigger_threshold.setMaximumWidth(120)
+        trigger_row2.addWidget(self._spin_trigger_threshold)
+        trigger_row2.addWidget(QLabel("预触发:"))
+        self._spin_trigger_pre_percent = QSpinBox()
+        self._spin_trigger_pre_percent.setRange(0, 100)
+        self._spin_trigger_pre_percent.setValue(20)
+        self._spin_trigger_pre_percent.setSuffix("%")
+        self._spin_trigger_pre_percent.setMaximumWidth(80)
+        trigger_row2.addWidget(self._spin_trigger_pre_percent)
+        trigger_row2.addStretch()
+        trigger_layout.addLayout(trigger_row2)
+
+        trigger_row3 = QHBoxLayout()
+        trigger_row3.addWidget(QLabel("长度:"))
+        self._spin_trigger_length = QDoubleSpinBox()
+        self._spin_trigger_length.setRange(0.001, 3600000.0)
+        self._spin_trigger_length.setDecimals(3)
+        self._spin_trigger_length.setSingleStep(0.1)
+        self._spin_trigger_length.setValue(2.0)
+        self._spin_trigger_length.setMaximumWidth(110)
+        trigger_row3.addWidget(self._spin_trigger_length)
+        self._combo_trigger_length_unit = QComboBox()
+        self._combo_trigger_length_unit.addItem("us", 0.001)
+        self._combo_trigger_length_unit.addItem("ms", 1.0)
+        self._combo_trigger_length_unit.addItem("s", 1000.0)
+        self._combo_trigger_length_unit.addItem("min", 60000.0)
+        self._combo_trigger_length_unit.setCurrentText("s")
+        self._combo_trigger_length_unit.setMaximumWidth(70)
+        trigger_row3.addWidget(self._combo_trigger_length_unit)
+        self._lbl_trigger_points = QLabel("点数: --")
+        trigger_row3.addWidget(self._lbl_trigger_points)
+        trigger_row3.addStretch()
+        trigger_layout.addLayout(trigger_row3)
+
+        self._lbl_trigger_state = QLabel("触发: 关闭")
+        self._lbl_trigger_state.setStyleSheet("color: #888888; font-size: 12px;")
+        trigger_layout.addWidget(self._lbl_trigger_state)
+        self._make_group_collapsible(trigger_group)
+        self._right_splitter.addWidget(trigger_group)
+        self._refresh_trigger_channel_combo()
+
+        self._right_splitter.setSizes([520, 190, 210])
 
         self._h_splitter.addWidget(right_panel)
         # 波形区默认占主导, 但右侧配置区允许按需拉宽。
@@ -250,6 +341,7 @@ class MainWindow(QMainWindow):
 
         rx_ctrl = QVBoxLayout()
         self._chk_hex_rx = QCheckBox("HEX显示")
+        self._chk_hex_rx.setChecked(True)
         rx_ctrl.addWidget(self._chk_hex_rx)
         self._chk_ascii_rx = QCheckBox("ASCII显示")
         rx_ctrl.addWidget(self._chk_ascii_rx)
@@ -275,6 +367,7 @@ class MainWindow(QMainWindow):
 
         tx_ctrl = QVBoxLayout()
         self._chk_hex_tx = QCheckBox("HEX发送")
+        self._chk_hex_tx.setChecked(True)
         tx_ctrl.addWidget(self._chk_hex_tx)
         btn_send = QPushButton("发送")
         btn_send.setStyleSheet(
@@ -323,6 +416,34 @@ class MainWindow(QMainWindow):
         self._lbl_ber = QLabel("误码率: 0.000%")
         self._statusbar.addWidget(self._lbl_ber)
 
+    def _make_group_collapsible(self, group):
+        group.setCheckable(True)
+        group.setChecked(True)
+        group.toggled.connect(
+            lambda checked, g=group: self._set_group_expanded(g, checked))
+        self._set_group_expanded(group, True)
+
+    def _set_group_expanded(self, group, expanded):
+        layout = group.layout()
+        if layout is not None:
+            self._set_layout_visible(layout, expanded)
+        if expanded:
+            group.setMaximumHeight(16777215)
+        else:
+            collapsed_height = group.fontMetrics().height() + 24
+            group.setMaximumHeight(collapsed_height)
+        group.updateGeometry()
+
+    def _set_layout_visible(self, layout, visible):
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget()
+            if widget is not None:
+                widget.setVisible(visible)
+            child_layout = item.layout()
+            if child_layout is not None:
+                self._set_layout_visible(child_layout, visible)
+
     def _connect_signals(self):
         self._serial.data_received.connect(self._on_data_received)
         self._serial.connection_changed.connect(self._on_connection_changed)
@@ -348,6 +469,21 @@ class MainWindow(QMainWindow):
             self._on_frame_period_changed)
         self._chk_hex_rx.toggled.connect(self._on_hex_rx_toggled)
         self._chk_ascii_rx.toggled.connect(self._on_ascii_rx_toggled)
+        self._chk_trigger_enable.toggled.connect(
+            self._on_trigger_enable_toggled)
+        self._btn_trigger_arm.clicked.connect(self._arm_trigger_capture)
+        self._combo_trigger_channel.currentIndexChanged.connect(
+            self._reset_trigger_after_setting_change)
+        self._combo_trigger_mode.currentIndexChanged.connect(
+            self._reset_trigger_after_setting_change)
+        self._spin_trigger_threshold.valueChanged.connect(
+            self._reset_trigger_after_setting_change)
+        self._spin_trigger_pre_percent.valueChanged.connect(
+            self._on_trigger_sample_setting_changed)
+        self._spin_trigger_length.valueChanged.connect(
+            self._on_trigger_sample_setting_changed)
+        self._combo_trigger_length_unit.currentIndexChanged.connect(
+            self._on_trigger_sample_setting_changed)
 
     # ─── 串口操作 ─────────────────────────────────────────────
 
@@ -362,6 +498,225 @@ class MainWindow(QMainWindow):
             self._chk_hex_rx.blockSignals(True)
             self._chk_hex_rx.setChecked(False)
             self._chk_hex_rx.blockSignals(False)
+
+    # ─── 触发采样 ─────────────────────────────────────────────
+
+    def _refresh_trigger_channel_combo(self, active_count=None):
+        if not hasattr(self, '_combo_trigger_channel'):
+            return
+
+        current = self._combo_trigger_channel.currentData()
+        if current is None:
+            current = 0
+        if active_count is None:
+            active_count = (
+                self._spin_channels.value()
+                if hasattr(self, '_spin_channels') else 10)
+        active_count = max(1, min(int(active_count), 10))
+
+        self._combo_trigger_channel.blockSignals(True)
+        self._combo_trigger_channel.clear()
+        for ch in range(active_count):
+            cfg = self._channel_config.get_channel_config(ch)
+            name = cfg['name'] if cfg else f"CH{ch + 1}"
+            self._combo_trigger_channel.addItem(
+                f"CH{ch + 1}: {name}", ch)
+        index = self._combo_trigger_channel.findData(current)
+        self._combo_trigger_channel.setCurrentIndex(max(0, index))
+        self._combo_trigger_channel.blockSignals(False)
+
+    def _on_trigger_enable_toggled(self, checked):
+        self._btn_trigger_arm.setEnabled(checked)
+        if checked:
+            self._arm_trigger_capture()
+        else:
+            self._reset_trigger_capture_state()
+            self._waveform.set_follow_latest_enabled(True)
+            self._lbl_trigger_state.setText("触发: 关闭")
+
+    def _reset_trigger_after_setting_change(self, *_):
+        if self._chk_trigger_enable.isChecked():
+            self._arm_trigger_capture()
+
+    def _on_trigger_sample_setting_changed(self, *_):
+        self._update_trigger_sample_count_label()
+        self._reset_trigger_after_setting_change()
+
+    def _trigger_source_channel(self):
+        ch = self._combo_trigger_channel.currentData()
+        if ch is None:
+            return 0
+        return int(ch)
+
+    def _trigger_mode(self):
+        mode = self._combo_trigger_mode.currentData()
+        return mode or "rising"
+
+    def _trigger_length_ms(self):
+        factor = self._combo_trigger_length_unit.currentData()
+        if factor is None:
+            factor = 1000.0
+        return max(0.001, self._spin_trigger_length.value() * float(factor))
+
+    def _trigger_sample_counts(self):
+        interval_ms = max(float(self._device_frame_period_ms), 0.001)
+        total = max(1, int(math.ceil(
+            self._trigger_length_ms() / interval_ms - 1e-12)))
+        pre_percent = self._spin_trigger_pre_percent.value() / 100.0
+        pre = int(round(total * pre_percent))
+        pre = max(0, min(pre, max(0, total - 1)))
+        return total, pre
+
+    def _update_trigger_sample_count_label(self, *_):
+        if not hasattr(self, '_lbl_trigger_points'):
+            return
+        total, pre = self._trigger_sample_counts()
+        self._lbl_trigger_points.setText(f"点数: {total} 预:{pre}")
+
+    def _reset_trigger_capture_state(self):
+        self._trigger_armed = False
+        self._trigger_capturing = False
+        self._trigger_pre_buffer = deque()
+        self._trigger_capture_frames = []
+        self._trigger_prev_value = None
+        self._trigger_total_samples = 0
+        self._trigger_pre_samples = 0
+        self._trigger_sample_index = None
+        self._hide_trigger_wait_dialog()
+
+    def _show_trigger_wait_dialog(self):
+        if self._trigger_wait_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("触发采样")
+            dialog.setModal(False)
+            dialog.setMinimumWidth(260)
+            layout = QVBoxLayout(dialog)
+            label = QLabel("触发采样中")
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("font-size: 18px; font-weight: bold;")
+            detail = QLabel("正在等待触发条件...")
+            detail.setAlignment(Qt.AlignCenter)
+            layout.addWidget(label)
+            layout.addWidget(detail)
+            self._trigger_wait_dialog = dialog
+        self._trigger_wait_dialog.show()
+        self._trigger_wait_dialog.raise_()
+
+    def _hide_trigger_wait_dialog(self):
+        if self._trigger_wait_dialog is not None:
+            self._trigger_wait_dialog.hide()
+
+    def _arm_trigger_capture(self, *_):
+        if not self._chk_trigger_enable.isChecked():
+            return
+
+        total, pre = self._trigger_sample_counts()
+        self._trigger_total_samples = total
+        self._trigger_pre_samples = pre
+        self._trigger_pre_buffer = deque(maxlen=pre)
+        self._trigger_capture_frames = []
+        self._trigger_prev_value = None
+        self._trigger_sample_index = None
+        self._trigger_armed = True
+        self._trigger_capturing = False
+
+        if total > self._spin_bufsize.value():
+            self._waveform.set_max_points(total)
+            self._on_buffer_size_changed(total)
+        self._waveform.set_follow_latest_enabled(False)
+        self._waveform.clear_data()
+
+        ch = self._trigger_source_channel()
+        mode_text = self._combo_trigger_mode.currentText()
+        threshold = self._spin_trigger_threshold.value()
+        self._lbl_trigger_state.setText(
+            f"触发采集中: 等待 CH{ch + 1} {mode_text} 阈值 {threshold:.6g}")
+        self._statusbar.showMessage("触发采集中: 已布防", 1500)
+        self._show_trigger_wait_dialog()
+
+    def _process_trigger_frames(self, frames):
+        if not self._chk_trigger_enable.isChecked():
+            self._waveform.add_data_points(frames)
+            return
+
+        if not self._trigger_armed and not self._trigger_capturing:
+            return
+
+        source_ch = self._trigger_source_channel()
+        for frame in frames:
+            if self._trigger_capturing:
+                if self._append_trigger_capture_frame(frame):
+                    break
+                continue
+
+            if not self._trigger_armed or source_ch >= len(frame):
+                continue
+
+            value = float(frame[source_ch])
+            if self._trigger_condition_met(self._trigger_prev_value, value):
+                self._hide_trigger_wait_dialog()
+                self._trigger_capturing = True
+                self._trigger_armed = False
+                self._trigger_capture_frames = list(self._trigger_pre_buffer)
+                self._trigger_sample_index = len(self._trigger_capture_frames)
+                self._trigger_capture_frames.append(frame)
+                self._trigger_pre_buffer.clear()
+                self._trigger_prev_value = value
+                if self._trigger_capture_complete():
+                    break
+            else:
+                self._trigger_pre_buffer.append(frame)
+                self._trigger_prev_value = value
+
+        if self._trigger_capturing:
+            captured = min(len(self._trigger_capture_frames),
+                           self._trigger_total_samples)
+            self._lbl_trigger_state.setText(
+                f"触发采集中: 捕获中 {captured}/{self._trigger_total_samples}")
+
+    def _append_trigger_capture_frame(self, frame):
+        self._trigger_capture_frames.append(frame)
+        return self._trigger_capture_complete()
+
+    def _trigger_capture_complete(self):
+        if len(self._trigger_capture_frames) < self._trigger_total_samples:
+            return False
+
+        captured = self._trigger_capture_frames[:self._trigger_total_samples]
+        self._trigger_capturing = False
+        self._trigger_armed = False
+        self._trigger_pre_buffer.clear()
+        self._trigger_capture_frames = captured
+
+        self._hide_trigger_wait_dialog()
+        self._waveform.set_follow_latest_enabled(True)
+        self._waveform.clear_data()
+        self._waveform.add_data_points(captured)
+        self._waveform._on_refresh_tick()
+        if self._trigger_sample_index is not None:
+            trigger_index = min(self._trigger_sample_index, len(captured) - 1)
+            self._waveform.set_trigger_marker_sample_index(trigger_index)
+        self._waveform.set_follow_latest_enabled(False)
+
+        self._lbl_trigger_state.setText(
+            f"触发: 完成 {len(captured)} 点")
+        self._statusbar.showMessage(
+            f"触发采样完成: {len(captured)} 点", 3000)
+        return True
+
+    def _trigger_condition_met(self, previous, current):
+        threshold = self._spin_trigger_threshold.value()
+        mode = self._trigger_mode()
+
+        if mode == "level":
+            return current >= threshold
+        if previous is None:
+            if mode == "falling":
+                return current <= threshold
+            return current >= threshold
+        if mode == "falling":
+            return previous > threshold >= current
+        return previous < threshold <= current
 
     def _refresh_ports(self):
         self._combo_port.clear()
@@ -500,6 +855,10 @@ class MainWindow(QMainWindow):
         self._update_error_rate_label()
         self._channel_config.set_channel_values([])
         self._waveform.clear_data()
+        if self._chk_trigger_enable.isChecked():
+            self._arm_trigger_capture()
+        else:
+            self._reset_trigger_capture_state()
 
     def _on_frame_decoded(self, values):
         self._on_frames_decoded([values])
@@ -513,7 +872,7 @@ class MainWindow(QMainWindow):
         self._fps_timer_count += frame_count
         self._latest_channel_values = frames[-1]
         self._live_ui_dirty = True
-        self._waveform.add_data_points(frames)
+        self._process_trigger_frames(frames)
 
     def _on_parse_error(self, msg):
         self._parse_error_count += 1
@@ -551,6 +910,7 @@ class MainWindow(QMainWindow):
         self._waveform.set_channel_color(ch_idx, config['color'])
         self._waveform.set_channel_visible(ch_idx, config['visible'])
         self._waveform.set_channel_unit(ch_idx, config.get('unit', ''))
+        self._refresh_trigger_channel_combo()
         if config['data_type'] != self._channel_data_types[ch_idx]:
             self._channel_data_types[ch_idx] = config['data_type']
             self._parser.set_channel_data_type(ch_idx, config['data_type'])
@@ -560,12 +920,15 @@ class MainWindow(QMainWindow):
         """解析器自动检测到帧格式"""
         self._spin_channels.setValue(num_ch)
         self._waveform.set_active_channel_count(num_ch)
+        self._refresh_trigger_channel_combo(num_ch)
         self._update_sample_interval()
         self._statusbar.showMessage(
             f"检测到协议: {num_ch}通道, 数据区{data_len}字节", 5000)
 
     def _on_buffer_size_changed(self, size):
         """波形组件自动调整缓冲点数, 同步到Spinbox"""
+        if size > self._spin_bufsize.maximum():
+            self._spin_bufsize.setMaximum(size)
         self._spin_bufsize.blockSignals(True)
         self._spin_bufsize.setValue(size)
         self._spin_bufsize.blockSignals(False)
@@ -592,6 +955,10 @@ class MainWindow(QMainWindow):
     def _update_sample_interval(self):
         """根据波特率和帧大小计算每帧时间间隔, 更新X轴刻度"""
         self._waveform.set_sample_interval_ms(self._device_frame_period_ms)
+        self._update_trigger_sample_count_label()
+        if (hasattr(self, '_chk_trigger_enable') and
+                self._chk_trigger_enable.isChecked()):
+            self._arm_trigger_capture()
 
     # ─── 状态更新 ─────────────────────────────────────────────
 
@@ -603,6 +970,10 @@ class MainWindow(QMainWindow):
             self._update_sample_interval()
             self._channel_config.set_channel_values([])
             self._waveform.clear_data()
+            if self._chk_trigger_enable.isChecked():
+                self._arm_trigger_capture()
+            else:
+                self._reset_trigger_capture_state()
 
             self._btn_connect.setText("关闭串口")
             self._btn_connect.setStyleSheet(
