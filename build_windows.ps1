@@ -41,14 +41,77 @@ function Resolve-Iscc {
     return $null
 }
 
+function Stop-PackagedAppFromDist {
+    $distRoot = [System.IO.Path]::GetFullPath($DistDir)
+    $candidates = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessName -eq $AppName }
+
+    foreach ($process in $candidates) {
+        $path = $null
+        try {
+            $path = $process.Path
+        } catch {
+            $path = $null
+        }
+
+        if (-not $path) {
+            continue
+        }
+
+        $fullPath = [System.IO.Path]::GetFullPath($path)
+        if (-not $fullPath.StartsWith($distRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        Write-Host "Closing running packaged app: $fullPath" -ForegroundColor Yellow
+        try {
+            $process.CloseMainWindow() | Out-Null
+            if (-not $process.WaitForExit(3000)) {
+                Stop-Process -Id $process.Id -Force
+                $process.WaitForExit(3000)
+            }
+        } catch {
+            throw "Could not close running app process '$fullPath'. Close USART Helper manually and rerun the build."
+        }
+    }
+}
+
+function Remove-PathWithRetry($Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -eq 5) {
+                throw @"
+Failed to delete '$Path'.
+
+The old build output is probably still in use. Close any running 'USART Helper.exe',
+close Explorer windows opened inside the dist/build folder, or wait for antivirus
+scanning to finish, then rerun:
+
+  .\build_windows.ps1 -Clean
+
+Original error: $($_.Exception.Message)
+"@
+            }
+
+            Start-Sleep -Milliseconds (300 * $attempt)
+        }
+    }
+}
+
 Set-Location $ProjectRoot
 
 if ($Clean) {
     Write-Step "Cleaning old build output"
+    Stop-PackagedAppFromDist
     foreach ($path in @($BuildDir, $DistDir, (Join-Path $ProjectRoot "installer_output"))) {
-        if (Test-Path -LiteralPath $path) {
-            Remove-Item -LiteralPath $path -Recurse -Force
-        }
+        Remove-PathWithRetry $path
     }
 }
 
