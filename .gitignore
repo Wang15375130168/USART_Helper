@@ -4,6 +4,5 @@ __pycache__/
 .venv-build/
 build/
 dist/
-installer_output/
 
 *.log
