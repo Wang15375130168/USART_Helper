@@ -275,7 +275,7 @@ installer_output\USART_Helper_Setup.exe
 目标电脑不需要安装 Python 或 Inno Setup，只需要具备串口设备对应的系统驱动。
 
 更详细的打包说明见 [PACKAGING.md](PACKAGING.md)。
-
+注：项目中已经编译完成安装包目录为：".\USART_Helper\installer_output\USART_Helper_Setup.exe"
 ## 项目结构
 
 ```text

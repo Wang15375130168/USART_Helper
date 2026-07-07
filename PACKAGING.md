@@ -41,7 +41,7 @@ installer_output\USART_Helper_Setup.exe
 ```
 
 把这个安装包复制到另一台电脑运行即可。默认安装到当前用户目录，不需要管理员权限，并可创建开始菜单和桌面快捷方式。
-
+注：项目中已经编译完成安装包目录为：".\USART_Helper\installer_output\USART_Helper_Setup.exe"
 ## 构建电脑需要的环境
 
 构建电脑需要：
