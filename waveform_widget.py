@@ -16,6 +16,17 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 
+DEFAULT_CHANNEL_COLORS = [
+    '#FF4444', '#44FF44', '#4488FF', '#FFAA00',
+    '#FF44FF', '#44FFFF', '#FFFF44', '#AAAAFF',
+    '#FF8888', '#88FF88'
+]
+
+
+def default_channel_color(ch_idx):
+    return DEFAULT_CHANNEL_COLORS[ch_idx % len(DEFAULT_CHANNEL_COLORS)]
+
+
 class TimeAxisItem(pg.AxisItem):
     """自适应时间单位的X轴 (µs / ms / s / min / h)"""
 
@@ -62,7 +73,7 @@ class TimeAxisItem(pg.AxisItem):
 
         if self._last_unit != 'compound':
             self._last_unit = 'compound'
-            self.setLabel(text='鏃堕棿', units='', **self._label_style)
+            self.setLabel(text='时间', units='', **self._label_style)
         return [self.format_time_ms(v) for v in values]
 
         factor, unit = self.best_unit(span_ms)
@@ -343,6 +354,7 @@ class CursorStatsDialog(QtWidgets.QDialog):
         self._table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self._table.setAlternatingRowColors(False)
+        self._table.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignCenter)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.ResizeToContents)
@@ -367,10 +379,7 @@ class CursorStatsDialog(QtWidgets.QDialog):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#E6E6E6")))
                 item.setBackground(QtGui.QBrush(QtGui.QColor(
                     "#252526" if row_idx % 2 else "#1E1E1E")))
-                item.setTextAlignment(
-                    QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
-                    if col_idx else
-                    QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
                 self._table.setItem(row_idx, col_idx, item)
 
     def set_lock_checked(self, checked):
@@ -391,7 +400,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
     selected_channel_changed = QtCore.pyqtSignal(int)
     buffer_size_changed = QtCore.pyqtSignal(int)  # 缓冲点数变化
 
-    def __init__(self, max_points=5000, num_channels=10, parent=None):
+    def __init__(self, max_points=5000, num_channels=6, parent=None):
         super().__init__(parent)
         self._max_points = max_points
         self._num_channels = num_channels
@@ -403,19 +412,8 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._buffers = [[] for _ in range(num_channels)]
         self._time_counter = 0
 
-        self._channel_configs = []
-        default_colors = [
-            '#FF4444', '#44FF44', '#4488FF', '#FFAA00',
-            '#FF44FF', '#44FFFF', '#FFFF44', '#AAAAFF',
-            '#FF8888', '#88FF88'
-        ]
-        for i in range(num_channels):
-            self._channel_configs.append({
-                'name': f'CH{i + 1}',
-                'color': default_colors[i],
-                'visible': True,
-                'unit': '',
-            })
+        self._channel_configs = [
+            self._default_channel_config(i) for i in range(num_channels)]
 
         self._main_view_box = None
         self._channel_view_boxes = []
@@ -431,9 +429,11 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._cursor_syncing = False
         self._cursor_lock_enabled = False
         self._cursor_pair_delta = 0.0
-        self._trigger_marker_line = None
+        self._trigger_marker_item = None
         self._trigger_marker_label = None
         self._trigger_marker_sample_index = None
+        self._trigger_marker_channel = None
+        self._trigger_marker_view_box = None
         self._dirty = False
         self._needs_initial_range = True
         self._auto_x_range_update = False
@@ -446,6 +446,15 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._refresh_timer = QtCore.QTimer()
         self._refresh_timer.timeout.connect(self._on_refresh_tick)
         self._refresh_timer.start(33)
+
+    @staticmethod
+    def _default_channel_config(ch_idx):
+        return {
+            'name': f'CH{ch_idx + 1}',
+            'color': default_channel_color(ch_idx),
+            'visible': True,
+            'unit': '',
+        }
 
     def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -559,6 +568,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
 
         # 监听X轴范围变化, 自动调整缓冲点数
         vb.sigXRangeChanged.connect(self._on_x_range_changed)
+        vb.sigYRangeChanged.connect(self._on_main_y_range_changed)
         vb.sigResized.connect(self._sync_channel_view_boxes)
 
         # 消除 PlotItem 内部布局边距
@@ -874,31 +884,53 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         当前选中的通道放在主 ViewBox 中接收鼠标缩放/平移；其他通道放在
         与主绘图区重叠的独立 ViewBox 中，并只同步X轴。
         """
-        main_vb = self._main_view_box
-        scene = self._plot_item.scene()
-
         for i in range(self._num_channels):
-            cfg = self._channel_configs[i]
-            pen = pg.mkPen(cfg['color'], width=1.5)
-            curve = pg.PlotDataItem(pen=pen, antialias=False)
-
-            ch_vb = pg.ViewBox(enableMenu=False)
-            ch_vb.setDefaultPadding(0)
-            ch_vb.setContentsMargins(0, 0, 0, 0)
-            ch_vb.setMouseEnabled(x=False, y=False)
-            ch_vb.setLimits(xMin=0)
-            ch_vb.setXLink(main_vb)
-            ch_vb.setZValue(-10)
-            scene.addItem(ch_vb)
-
-            owner_vb = main_vb if i == self._selected_channel else ch_vb
-            owner_vb.addItem(curve)
-
-            self._channel_view_boxes.append(ch_vb)
-            self._curve_view_boxes.append(owner_vb)
-            self._curves.append(curve)
+            self._add_channel_plot(i)
 
         self._sync_channel_view_boxes()
+
+    def _add_channel_plot(self, ch_idx):
+        main_vb = self._main_view_box
+        scene = self._plot_item.scene()
+        cfg = self._channel_configs[ch_idx]
+        pen = pg.mkPen(cfg['color'], width=1.5)
+        curve = pg.PlotDataItem(pen=pen, antialias=False)
+
+        ch_vb = pg.ViewBox(enableMenu=False)
+        ch_vb.setDefaultPadding(0)
+        ch_vb.setContentsMargins(0, 0, 0, 0)
+        ch_vb.setMouseEnabled(x=False, y=False)
+        ch_vb.setLimits(xMin=0)
+        ch_vb.setXLink(main_vb)
+        ch_vb.setZValue(-10)
+        ch_vb.sigYRangeChanged.connect(
+            lambda viewbox, range_info, ch=ch_idx:
+            self._on_channel_y_range_changed(ch, range_info))
+        scene.addItem(ch_vb)
+
+        owner_vb = main_vb if ch_idx == self._selected_channel else ch_vb
+        owner_vb.addItem(curve)
+
+        self._channel_view_boxes.append(ch_vb)
+        self._curve_view_boxes.append(owner_vb)
+        self._curves.append(curve)
+
+    def _remove_channel_plot(self, ch_idx):
+        if ch_idx >= len(self._curves):
+            return
+
+        curve = self._curves[ch_idx]
+        owner_vb = self._curve_view_boxes[ch_idx]
+        try:
+            owner_vb.removeItem(curve)
+        except (TypeError, RuntimeError):
+            pass
+
+        ch_vb = self._channel_view_boxes[ch_idx]
+        try:
+            self._plot_item.scene().removeItem(ch_vb)
+        except (TypeError, RuntimeError):
+            pass
 
     def _sync_channel_view_boxes(self, *args):
         """让所有叠加 ViewBox 与主绘图区完全重合。"""
@@ -1117,7 +1149,13 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         for values in frames:
             self._time_counter += 1
             for i, value in enumerate(values[:active_count]):
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    value = float('nan')
                 self._buffers[i].append(value)
+                if not math.isfinite(value):
+                    continue
                 if value < batch_min[i]:
                     batch_min[i] = value
                 if value > batch_max[i]:
@@ -1296,6 +1334,29 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             self._dirty = True
         self._apply_cursor_anchor_ratios(x_min, x_max)
 
+    def _on_main_y_range_changed(self, viewbox, range_info):
+        if 0 <= self._selected_channel < len(self._channel_y_ranges):
+            self._channel_y_ranges[self._selected_channel] = tuple(range_info)
+        self._update_cursor_info()
+        self._update_trigger_marker_position()
+
+    def _on_channel_y_range_changed(self, ch, range_info):
+        if 0 <= ch < len(self._channel_y_ranges):
+            self._channel_y_ranges[ch] = tuple(range_info)
+        self._update_trigger_marker_position()
+
+    @staticmethod
+    def _data_offset_for_screen_pixels(view_box, dx_px=0.0, dy_up_px=0.0):
+        if view_box is None:
+            return 0.0, 0.0
+        rect = view_box.sceneBoundingRect()
+        width = max(float(rect.width()), 1.0)
+        height = max(float(rect.height()), 1.0)
+        x_range, y_range = view_box.viewRange()
+        x_span = max(float(x_range[1] - x_range[0]), 1e-12)
+        y_span = max(float(y_range[1] - y_range[0]), 1e-12)
+        return float(dx_px) * x_span / width, float(dy_up_px) * y_span / height
+
     # ─── 通道配置 ─────────────────────────────────────────────
 
     def _update_cursor_anchor_ratios(self):
@@ -1354,6 +1415,52 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             self._dirty = True
             self._update_cursor_info()
 
+    def channel_count(self):
+        return self._num_channels
+
+    def set_channel_count(self, count):
+        count = max(1, int(count))
+        if count == self._num_channels:
+            return
+
+        old_count = self._num_channels
+        if count > old_count:
+            for ch_idx in range(old_count, count):
+                self._channel_configs.append(
+                    self._default_channel_config(ch_idx))
+                self._buffers.append([])
+                self._channel_y_ranges.append(None)
+                self._combo_y_ch.addItem(f"CH{ch_idx + 1}", ch_idx)
+                self._add_channel_plot(ch_idx)
+            self._num_channels = count
+            self._active_channel_count = count
+        else:
+            for ch_idx in range(old_count - 1, count - 1, -1):
+                self._remove_channel_plot(ch_idx)
+                del self._curves[ch_idx]
+                del self._curve_view_boxes[ch_idx]
+                del self._channel_view_boxes[ch_idx]
+                del self._channel_configs[ch_idx]
+                del self._buffers[ch_idx]
+                del self._channel_y_ranges[ch_idx]
+                self._combo_y_ch.removeItem(ch_idx)
+            self._num_channels = count
+            self._active_channel_count = min(self._active_channel_count, count)
+
+            if self._selected_channel >= count:
+                self._selected_channel = count - 1
+                if self._main_view_box is not None:
+                    self._move_curve_to_view_box(
+                        self._selected_channel, self._main_view_box)
+                    self._apply_channel_y_range(
+                        self._selected_channel, self._main_view_box)
+                self.selected_channel_changed.emit(self._selected_channel)
+
+        self._sync_channel_view_boxes()
+        self._update_axis_display()
+        self._dirty = True
+        self._update_cursor_info()
+
     def set_active_channel_count(self, count):
         count = max(0, min(int(count), self._num_channels))
         if count == self._active_channel_count:
@@ -1376,10 +1483,100 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             if ch == self._selected_channel:
                 self._update_axis_display()
 
+    def load_sample_data(self, frames, sample_interval_ms=None,
+                         channel_configs=None, trigger_index=None,
+                         trigger_channel=None, follow_latest=True):
+        """Replace current waveform data with imported samples."""
+        if channel_configs:
+            self.set_channel_count(len(channel_configs))
+            for ch, config in enumerate(channel_configs):
+                self.set_channel_name(ch, config.get('name', f'CH{ch + 1}'))
+                self.set_channel_color(
+                    ch, config.get('color', default_channel_color(ch)))
+                self.set_channel_visible(ch, config.get('visible', True))
+                self.set_channel_unit(ch, config.get('unit', ''))
+        elif frames:
+            self.set_channel_count(max(len(values) for values in frames))
+
+        if sample_interval_ms is not None:
+            self.set_sample_interval_ms(sample_interval_ms)
+
+        self.clear_data()
+        self.set_follow_latest_enabled(True)
+        if frames:
+            self.add_data_points(frames)
+            self._on_refresh_tick()
+            self._set_full_data_x_range()
+            self._auto_range_all_channels()
+        self.set_follow_latest_enabled(follow_latest)
+        if trigger_index is not None:
+            self.set_trigger_marker_sample_index(trigger_index, trigger_channel)
+
+    def _set_full_data_x_range(self):
+        if self._main_view_box is None or self._time_counter <= 1:
+            return
+        x_min = 0.0
+        x_max = (self._time_counter - 1) * self._sample_interval_ms
+        self._auto_x_range_update = True
+        try:
+            self._main_view_box.setXRange(x_min, x_max, padding=0)
+        finally:
+            self._auto_x_range_update = False
+
     def get_channel_config(self, ch):
         if 0 <= ch < self._num_channels:
             return dict(self._channel_configs[ch])
         return None
+
+    def get_sample_data(self):
+        """Return buffered waveform data aligned by global sample index."""
+        channel_count = min(self._active_channel_count, self._num_channels)
+        channels = list(range(channel_count))
+        populated = [
+            ch for ch in channels
+            if ch < len(self._buffers) and len(self._buffers[ch]) > 0
+        ]
+        if not populated:
+            return {
+                'sample_interval_ms': self._sample_interval_ms,
+                'channel_configs': [
+                    dict(self._channel_configs[ch]) for ch in channels],
+                'rows': [],
+            }
+
+        starts = {
+            ch: self._buffer_start_sample_index(self._buffers[ch])
+            for ch in populated
+        }
+        first_sample = min(starts.values())
+        last_sample = max(
+            starts[ch] + len(self._buffers[ch]) - 1 for ch in populated)
+
+        rows = []
+        for sample_index in range(first_sample, last_sample + 1):
+            values = []
+            has_value = False
+            for ch in channels:
+                buf = self._buffers[ch]
+                if not buf:
+                    values.append(None)
+                    continue
+                start = self._buffer_start_sample_index(buf)
+                offset = sample_index - start
+                if 0 <= offset < len(buf):
+                    values.append(buf[offset])
+                    has_value = True
+                else:
+                    values.append(None)
+            if has_value:
+                rows.append((sample_index, values))
+
+        return {
+            'sample_interval_ms': self._sample_interval_ms,
+            'channel_configs': [
+                dict(self._channel_configs[ch]) for ch in channels],
+            'rows': rows,
+        }
 
     # ─── 游标卡尺 ─────────────────────────────────────────────
 
@@ -1625,10 +1822,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         if self._main_view_box is None:
             return 0.0
         y_min, y_max = self._main_view_box.viewRange()[1]
-        span = y_max - y_min
-        if span <= 0:
-            return y_max
-        return y_max - span * 0.04
+        _, top_margin = self._data_offset_for_screen_pixels(
+            self._main_view_box, dy_up_px=14.0)
+        return max(y_min, y_max - top_margin)
 
     def _cursor_value_label_html(self, title, t_value, rows, value_key):
         lines = [
@@ -1701,6 +1897,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         if len(buf) == 0:
             return
         y = np.fromiter(buf, dtype=np.float64)
+        y = y[np.isfinite(y)]
+        if y.size == 0:
+            return
         y_min, y_max = float(np.min(y)), float(np.max(y))
         margin = max((y_max - y_min) * 0.05, 1.0)
         self._channel_y_ranges[ch] = (y_min - margin, y_max + margin)
@@ -1747,7 +1946,76 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._follow_latest_x = bool(enabled)
         self._dirty = True
 
-    def set_trigger_marker_sample_index(self, sample_index):
+    def _trigger_marker_channel_index(self):
+        if self._trigger_marker_channel is None:
+            return self._selected_channel
+        if 0 <= self._trigger_marker_channel < self._num_channels:
+            return self._trigger_marker_channel
+        return self._selected_channel
+
+    def _trigger_marker_target_view_box(self):
+        channel = self._trigger_marker_channel_index()
+        if 0 <= channel < len(self._curve_view_boxes):
+            return self._curve_view_boxes[channel]
+        return self._main_view_box
+
+    def _move_trigger_marker_to_view_box(self):
+        if self._trigger_marker_item is None:
+            return
+        target_view_box = self._trigger_marker_target_view_box()
+        if target_view_box is None:
+            return
+        if self._trigger_marker_view_box is target_view_box:
+            return
+
+        items = (self._trigger_marker_item, self._trigger_marker_label)
+        if self._trigger_marker_view_box is not None:
+            for item in items:
+                if item is None:
+                    continue
+                try:
+                    self._trigger_marker_view_box.removeItem(item)
+                except (TypeError, RuntimeError, ValueError):
+                    pass
+        else:
+            for item in items:
+                if item is None:
+                    continue
+                try:
+                    self._plot_item.removeItem(item)
+                except (TypeError, RuntimeError, ValueError):
+                    pass
+
+        for item in items:
+            if item is None:
+                continue
+            try:
+                target_view_box.addItem(item)
+            except (TypeError, RuntimeError, ValueError):
+                pass
+        self._trigger_marker_view_box = target_view_box
+
+    def _trigger_marker_y_value(self):
+        channel = self._trigger_marker_channel_index()
+        if not (0 <= channel < len(self._buffers)):
+            return None
+        sample_index = self._trigger_marker_sample_index
+        if sample_index is None:
+            return None
+        buffer_start = self._buffer_start_sample_index(self._buffers[channel])
+        offset = sample_index - buffer_start
+        if not (0 <= offset < len(self._buffers[channel])):
+            return None
+        value = self._buffers[channel][offset]
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    def set_trigger_marker_sample_index(self, sample_index, channel=None):
         self.clear_trigger_marker()
         try:
             sample_index = int(sample_index)
@@ -1757,42 +2025,84 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             return
 
         self._trigger_marker_sample_index = sample_index
+        try:
+            channel = int(channel) if channel is not None else None
+        except (TypeError, ValueError):
+            channel = None
+        self._trigger_marker_channel = (
+            channel if channel is not None and
+            0 <= channel < self._num_channels else None)
         x_pos = sample_index * self._sample_interval_ms
-        pen = pg.mkPen('#FFD166', width=2, style=QtCore.Qt.DashLine)
-        self._trigger_marker_line = pg.InfiniteLine(
-            pos=x_pos, angle=90, movable=False, pen=pen)
-        self._trigger_marker_line.setZValue(900)
-        self._plot_item.addItem(self._trigger_marker_line)
+        marker_path = QtGui.QPainterPath()
+        marker_path.moveTo(0, 0)
+        marker_path.lineTo(-7, -14)
+        marker_path.lineTo(7, -14)
+        marker_path.closeSubpath()
+        self._trigger_marker_item = QtWidgets.QGraphicsPathItem(marker_path)
+        self._trigger_marker_item.setFlag(
+            QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
+        self._trigger_marker_item.setPen(
+            pg.mkPen('#FFD166', width=1.2))
+        self._trigger_marker_item.setBrush(pg.mkBrush('#FFD166'))
+        self._trigger_marker_item.setPos(x_pos, 0.0)
+        self._trigger_marker_item.setZValue(1001)
 
         self._trigger_marker_label = pg.TextItem(
-            html="<span style='color:#FFD166; font-weight:bold;'>▼ 触发点</span>",
-            anchor=(0.5, 1),
-            border=pg.mkPen('#FFD166'),
-            fill=pg.mkBrush(30, 30, 30, 220))
+            html="<span style='color:#FFD166; font-weight:bold;'>触发点</span>",
+            anchor=(0, 0.5),
+            fill=pg.mkBrush(30, 30, 30, 180))
         self._trigger_marker_label.setZValue(1001)
-        self._plot_item.addItem(self._trigger_marker_label)
+        self._move_trigger_marker_to_view_box()
         self._update_trigger_marker_position()
 
     def clear_trigger_marker(self):
-        for item_name in ('_trigger_marker_line', '_trigger_marker_label'):
+        for item_name in ('_trigger_marker_item', '_trigger_marker_label'):
             item = getattr(self, item_name)
             if item is not None:
                 try:
-                    self._plot_item.removeItem(item)
-                except (TypeError, RuntimeError):
+                    if self._trigger_marker_view_box is not None:
+                        self._trigger_marker_view_box.removeItem(item)
+                    else:
+                        self._plot_item.removeItem(item)
+                except (TypeError, RuntimeError, ValueError):
                     pass
                 setattr(self, item_name, None)
         self._trigger_marker_sample_index = None
+        self._trigger_marker_channel = None
+        self._trigger_marker_view_box = None
 
     def _update_trigger_marker_position(self):
         if self._trigger_marker_sample_index is None:
             return
         x_pos = self._trigger_marker_sample_index * self._sample_interval_ms
-        if self._trigger_marker_line is not None:
-            self._trigger_marker_line.setValue(x_pos)
-        if self._trigger_marker_label is not None and self._main_view_box is not None:
-            y_min, y_max = self._main_view_box.viewRange()[1]
-            self._trigger_marker_label.setPos(x_pos, y_max)
+        self._move_trigger_marker_to_view_box()
+        view_box = self._trigger_marker_view_box
+        if view_box is None:
+            return
+        x_min, x_max = view_box.viewRange()[0]
+        y_min, y_max = view_box.viewRange()[1]
+        span = max(y_max - y_min, 1.0)
+        y_pos = self._trigger_marker_y_value()
+        if y_pos is None:
+            y_pos = y_max - span * 0.04
+        label_dx, _ = self._data_offset_for_screen_pixels(
+            view_box, dx_px=14.0)
+        _, label_dy = self._data_offset_for_screen_pixels(
+            view_box, dy_up_px=8.0)
+        edge_dx, _ = self._data_offset_for_screen_pixels(
+            view_box, dx_px=90.0)
+        label_x = x_pos + label_dx
+        label_anchor = (0, 0.5)
+        if label_x > x_max - edge_dx:
+            label_x = x_pos - label_dx
+            label_anchor = (1, 0.5)
+        label_y = y_pos + label_dy
+        if self._trigger_marker_item is not None:
+            self._trigger_marker_item.setPos(x_pos, y_pos)
+        if self._trigger_marker_label is not None:
+            if hasattr(self._trigger_marker_label, 'setAnchor'):
+                self._trigger_marker_label.setAnchor(label_anchor)
+            self._trigger_marker_label.setPos(label_x, label_y)
 
     def set_sample_interval_ms(self, interval_ms):
         """设置每帧数据的时间间隔(ms), 用于将样本索引转换为时间"""

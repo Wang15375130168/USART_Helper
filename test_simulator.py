@@ -1,6 +1,6 @@
 """串口数据模拟器 - 用于测试波形显示功能
 
-直接启动主窗口并模拟10通道正弦波数据，无需真实串口设备。
+直接启动主窗口并模拟6通道正弦波数据，无需真实串口设备。
 运行方式: python test_simulator.py
 """
 import sys
@@ -9,11 +9,13 @@ import struct
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QTimer
 from main_window import MainWindow
-from data_parser import DATA_TYPE_DEFS, DEFAULT_SEGMENT_TYPES
+from data_parser import (
+    DATA_TYPE_DEFS, DEFAULT_SEGMENT_TYPES, DEFAULT_CHANNEL_COUNT
+)
 
 
 class DataSimulator:
-    """数据模拟器 - 生成10通道测试数据"""
+    """数据模拟器 - 生成默认通道数的测试数据"""
 
     def __init__(self, main_window):
         self._win = main_window
@@ -40,7 +42,7 @@ class DataSimulator:
         self._counter += 1
         t = self._counter * 0.05
 
-        # 10个通道: 不同频率和波形
+        # 多个通道: 不同频率和波形
         values = [
             100 * math.sin(t * 1.0),                       # CH1: 低频正弦
             80 * math.sin(t * 2.5),                        # CH2: 中频正弦
@@ -62,9 +64,9 @@ class DataSimulator:
     def _build_frame(values):
         """构建协议帧"""
         payload = bytearray()
-        # Match the firmware test frame shown by the device:
-        # CH1/CH2 int16, CH3/CH4 uint16, CH5-CH7 int32 = 20 data bytes.
-        for v, data_type in zip(values[:7], DEFAULT_SEGMENT_TYPES[:7]):
+        for v, data_type in zip(
+                values[:DEFAULT_CHANNEL_COUNT],
+                DEFAULT_SEGMENT_TYPES[:DEFAULT_CHANNEL_COUNT]):
             size, fmt = DATA_TYPE_DEFS[data_type]
             if data_type.startswith('float'):
                 val = float(v)

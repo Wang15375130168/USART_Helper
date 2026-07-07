@@ -4,11 +4,14 @@ from PyQt5.QtWidgets import (
     QGroupBox, QLabel, QComboBox, QPushButton,
     QStatusBar, QSplitter, QTextEdit, QCheckBox,
     QLineEdit, QSpinBox, QDoubleSpinBox, QTabWidget, QMessageBox, QSizePolicy,
-    QDialog
+    QDialog, QFileDialog, QApplication, QProgressDialog, QProgressBar
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QStandardPaths
 from PyQt5.QtGui import QFont, QTextCursor
+import csv
 import math
+import os
+import re
 import time
 from collections import deque
 from datetime import datetime
@@ -16,7 +19,9 @@ from datetime import datetime
 from serial_handler import SerialHandler
 from data_parser import DataParser
 from waveform_widget import MultiChannelWaveform
-from channel_config import ChannelConfigPanel
+from channel_config import (
+    ChannelConfigPanel, DEFAULT_CHANNEL_COUNT, MAX_CHANNEL_COUNT
+)
 
 
 class MainWindow(QMainWindow):
@@ -30,7 +35,7 @@ class MainWindow(QMainWindow):
 
         # 核心模块
         self._serial = SerialHandler()
-        self._parser = DataParser()
+        self._parser = DataParser(num_channels=DEFAULT_CHANNEL_COUNT)
         self._channel_data_types = self._parser.data_types
         self._device_frame_period_ms = 1.0
 
@@ -61,7 +66,19 @@ class MainWindow(QMainWindow):
         self._trigger_total_samples = 0
         self._trigger_pre_samples = 0
         self._trigger_sample_index = None
+        self._trigger_sample_channel = None
         self._trigger_wait_dialog = None
+        self._trigger_wait_title_label = None
+        self._trigger_wait_detail_label = None
+        self._trigger_wait_progress = None
+        self._save_dir = (
+            QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+            or os.getcwd()
+        )
+        self._save_sequence_by_date = {}
+        self._pending_save_date = None
+        self._pending_save_sequence = None
+        self._waveform_import_mode = False
 
         self._setup_ui()
         self._connect_signals()
@@ -142,6 +159,25 @@ class MainWindow(QMainWindow):
             serial_layout.addWidget(combo)
             setattr(self, attr, combo)
 
+        tool_btn_style = (
+            "QPushButton { font-size: 13px; padding: 2px 8px; "
+            "min-height: 20px; }")
+        self._btn_save_waveform = QPushButton("保存波形")
+        self._btn_save_waveform.setToolTip(
+            "保存当前波形；触发采样完成时优先保存触发波形")
+        self._btn_save_waveform.setStyleSheet(tool_btn_style)
+        serial_layout.addWidget(self._btn_save_waveform)
+
+        self._btn_import_waveform = QPushButton("导入波形")
+        self._btn_import_waveform.setToolTip("导入已保存的CSV波形数据")
+        self._btn_import_waveform.setStyleSheet(tool_btn_style)
+        serial_layout.addWidget(self._btn_import_waveform)
+
+        self._btn_toggle_channel_panel = QPushButton("隐藏配置")
+        self._btn_toggle_channel_panel.setToolTip("隐藏或显示右侧通道配置列")
+        self._btn_toggle_channel_panel.setStyleSheet(tool_btn_style)
+        serial_layout.addWidget(self._btn_toggle_channel_panel)
+
         serial_layout.addStretch()
 
         self._btn_connect = QPushButton("打开串口")
@@ -164,29 +200,35 @@ class MainWindow(QMainWindow):
 
         # 左侧: 波形显示
         self._waveform = MultiChannelWaveform(
-            max_points=5000, num_channels=10)
+            max_points=5000, num_channels=DEFAULT_CHANNEL_COUNT)
         self._h_splitter.addWidget(self._waveform)
 
         # 右侧: 通道配置 + 协议设置
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
+        self._right_panel = QWidget()
+        self._channel_panel_last_width = 420
+        self._channel_panel_visible = True
+        right_layout = QVBoxLayout(self._right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        self._right_splitter = QSplitter(Qt.Vertical)
-        self._right_splitter.setChildrenCollapsible(False)
-        right_layout.addWidget(self._right_splitter, 1)
+        right_layout.setSpacing(0)
+        self._right_content = QSplitter(Qt.Vertical)
+        self._right_content.setChildrenCollapsible(False)
+        right_layout.addWidget(self._right_content, 1)
 
-        self._channel_config = ChannelConfigPanel(num_channels=10)
-        self._right_splitter.addWidget(self._channel_config)
+        self._channel_config = ChannelConfigPanel(
+            num_channels=DEFAULT_CHANNEL_COUNT,
+            max_channels=MAX_CHANNEL_COUNT)
+        self._right_content.addWidget(self._channel_config)
 
         # 协议配置
         proto_group = QGroupBox("数据协议")
         proto_layout = QVBoxLayout(proto_group)
+        proto_layout.setAlignment(Qt.AlignTop)
 
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("通道数:"))
         self._spin_channels = QSpinBox()
-        self._spin_channels.setRange(1, 10)
-        self._spin_channels.setValue(10)
+        self._spin_channels.setRange(1, MAX_CHANNEL_COUNT)
+        self._spin_channels.setValue(DEFAULT_CHANNEL_COUNT)
         self._spin_channels.setReadOnly(True)  # 由解析器自动检测
         self._spin_channels.setButtonSymbols(QSpinBox.NoButtons)
         self._spin_channels.setStyleSheet(
@@ -221,7 +263,7 @@ class MainWindow(QMainWindow):
         info_label.setStyleSheet("color: #888888; font-size: 12px;")
         proto_layout.addWidget(info_label)
         self._make_group_collapsible(proto_group)
-        self._right_splitter.addWidget(proto_group)
+        self._right_content.addWidget(proto_group)
 
         # 缓冲区大小
         buf_layout = QHBoxLayout()
@@ -239,6 +281,7 @@ class MainWindow(QMainWindow):
         trigger_group = QGroupBox("触发采样")
         trigger_layout = QVBoxLayout(trigger_group)
         trigger_layout.setSpacing(4)
+        trigger_layout.setAlignment(Qt.AlignTop)
 
         trigger_top = QHBoxLayout()
         self._chk_trigger_enable = QCheckBox("启用触发")
@@ -268,7 +311,7 @@ class MainWindow(QMainWindow):
         trigger_row2.addWidget(QLabel("阈值:"))
         self._spin_trigger_threshold = QDoubleSpinBox()
         self._spin_trigger_threshold.setRange(-1e12, 1e12)
-        self._spin_trigger_threshold.setDecimals(6)
+        self._spin_trigger_threshold.setDecimals(3)
         self._spin_trigger_threshold.setSingleStep(1.0)
         self._spin_trigger_threshold.setMaximumWidth(120)
         trigger_row2.addWidget(self._spin_trigger_threshold)
@@ -308,20 +351,21 @@ class MainWindow(QMainWindow):
         self._lbl_trigger_state.setStyleSheet("color: #888888; font-size: 12px;")
         trigger_layout.addWidget(self._lbl_trigger_state)
         self._make_group_collapsible(trigger_group)
-        self._right_splitter.addWidget(trigger_group)
+        self._right_content.addWidget(trigger_group)
+        self._right_content.setSizes([520, 190, 230])
         self._refresh_trigger_channel_combo()
 
-        self._right_splitter.setSizes([520, 190, 210])
-
-        self._h_splitter.addWidget(right_panel)
+        self._h_splitter.addWidget(self._right_panel)
         # 波形区默认占主导, 但右侧配置区允许按需拉宽。
         self._h_splitter.setStretchFactor(0, 5)
         self._h_splitter.setStretchFactor(1, 1)
         self._h_splitter.setChildrenCollapsible(False)
-        right_panel.setMinimumWidth(360)
-        right_panel.setSizePolicy(
+        self._right_panel.setMinimumWidth(420)
+        self._right_panel.setSizePolicy(
             QSizePolicy.Preferred, QSizePolicy.Expanding)
-        self._h_splitter.setSizes([1040, 360])
+        self._h_splitter.setCollapsible(0, False)
+        self._h_splitter.setCollapsible(1, True)
+        self._h_splitter.setSizes([980, 420])
 
         self._v_splitter.addWidget(self._h_splitter)
 
@@ -453,10 +497,14 @@ class MainWindow(QMainWindow):
         self._parser.format_detected.connect(self._on_format_detected)
         self._channel_config.channel_changed.connect(
             self._on_channel_config_changed)
+        self._channel_config.channel_count_changed.connect(
+            self._on_channel_count_changed)
         self._channel_config.channel_selected.connect(
             self._waveform.select_channel)
         self._waveform.buffer_size_changed.connect(
             self._on_buffer_size_changed)
+        self._waveform._btn_clear.clicked.connect(
+            self._exit_waveform_import_mode)
         self._combo_baud.currentTextChanged.connect(
             self._on_serial_settings_changed)
         self._combo_databits.currentTextChanged.connect(
@@ -484,6 +532,10 @@ class MainWindow(QMainWindow):
             self._on_trigger_sample_setting_changed)
         self._combo_trigger_length_unit.currentIndexChanged.connect(
             self._on_trigger_sample_setting_changed)
+        self._btn_save_waveform.clicked.connect(self._save_current_waveform)
+        self._btn_import_waveform.clicked.connect(self._import_waveform_csv)
+        self._btn_toggle_channel_panel.clicked.connect(
+            self._toggle_channel_panel)
 
     # ─── 串口操作 ─────────────────────────────────────────────
 
@@ -511,8 +563,12 @@ class MainWindow(QMainWindow):
         if active_count is None:
             active_count = (
                 self._spin_channels.value()
-                if hasattr(self, '_spin_channels') else 10)
-        active_count = max(1, min(int(active_count), 10))
+                if hasattr(self, '_spin_channels')
+                else DEFAULT_CHANNEL_COUNT)
+        configured_count = (
+            self._channel_config.channel_count()
+            if hasattr(self, '_channel_config') else MAX_CHANNEL_COUNT)
+        active_count = max(1, min(int(active_count), configured_count))
 
         self._combo_trigger_channel.blockSignals(True)
         self._combo_trigger_channel.clear()
@@ -536,7 +592,11 @@ class MainWindow(QMainWindow):
 
     def _reset_trigger_after_setting_change(self, *_):
         if self._chk_trigger_enable.isChecked():
-            self._arm_trigger_capture()
+            self._reset_trigger_capture_state()
+            self._waveform.set_follow_latest_enabled(False)
+            self._lbl_trigger_state.setText("触发: 参数已修改，点击重新触发")
+            self._statusbar.showMessage(
+                "触发参数已修改，请点击重新触发开始采样", 2500)
 
     def _on_trigger_sample_setting_changed(self, *_):
         self._update_trigger_sample_count_label()
@@ -582,34 +642,97 @@ class MainWindow(QMainWindow):
         self._trigger_total_samples = 0
         self._trigger_pre_samples = 0
         self._trigger_sample_index = None
+        self._trigger_sample_channel = None
         self._hide_trigger_wait_dialog()
 
-    def _show_trigger_wait_dialog(self):
+    def _show_trigger_wait_dialog(self, title="触发采样中",
+                                  detail_text="正在等待触发条件...",
+                                  progress_value=None,
+                                  progress_total=None):
         if self._trigger_wait_dialog is None:
             dialog = QDialog(self)
             dialog.setWindowTitle("触发采样")
             dialog.setModal(False)
-            dialog.setMinimumWidth(260)
+            dialog.setMinimumWidth(320)
             layout = QVBoxLayout(dialog)
             label = QLabel("触发采样中")
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet("font-size: 18px; font-weight: bold;")
             detail = QLabel("正在等待触发条件...")
             detail.setAlignment(Qt.AlignCenter)
+            detail.setWordWrap(True)
+            progress = QProgressBar()
+            progress.setTextVisible(True)
+            progress.setAlignment(Qt.AlignCenter)
+            progress.setMinimumWidth(260)
+            progress.setMaximumWidth(300)
+            progress.setStyleSheet("QProgressBar { text-align: center; }")
             layout.addWidget(label)
             layout.addWidget(detail)
+            layout.addWidget(progress, 0, Qt.AlignHCenter)
             self._trigger_wait_dialog = dialog
+            self._trigger_wait_title_label = label
+            self._trigger_wait_detail_label = detail
+            self._trigger_wait_progress = progress
+
+        if self._trigger_wait_title_label is not None:
+            self._trigger_wait_title_label.setText(title)
+        if self._trigger_wait_detail_label is not None:
+            self._trigger_wait_detail_label.setText(detail_text)
+        if self._trigger_wait_progress is not None:
+            if progress_value is None or progress_total is None:
+                self._trigger_wait_progress.setRange(0, 0)
+                self._trigger_wait_progress.setFormat("等待触发")
+            else:
+                progress_total = max(1, int(progress_total))
+                progress_value = max(0, min(int(progress_value), progress_total))
+                self._trigger_wait_progress.setRange(0, progress_total)
+                self._trigger_wait_progress.setValue(progress_value)
+                percent = progress_value / progress_total * 100.0
+                self._trigger_wait_progress.setFormat(
+                    f"{progress_value}/{progress_total} ({percent:.1f}%)")
+        was_visible = self._trigger_wait_dialog.isVisible()
         self._trigger_wait_dialog.show()
+        if not was_visible:
+            self._center_trigger_wait_dialog()
         self._trigger_wait_dialog.raise_()
 
     def _hide_trigger_wait_dialog(self):
         if self._trigger_wait_dialog is not None:
             self._trigger_wait_dialog.hide()
 
+    def _center_trigger_wait_dialog(self):
+        if self._trigger_wait_dialog is None:
+            return
+        self._trigger_wait_dialog.adjustSize()
+        parent_rect = self.frameGeometry()
+        dialog_rect = self._trigger_wait_dialog.frameGeometry()
+        dialog_rect.moveCenter(parent_rect.center())
+        self._trigger_wait_dialog.move(dialog_rect.topLeft())
+
+    def _update_trigger_capture_progress_dialog(self, force=False):
+        captured = min(len(self._trigger_capture_frames),
+                       self._trigger_total_samples)
+        total = max(1, self._trigger_total_samples)
+        refresh_step = max(1, total // 100)
+        if (not force and captured not in (0, 1, total) and
+                captured % refresh_step != 0):
+            return
+
+        text = f"触发采集中: 捕获中 {captured}/{total}"
+        self._lbl_trigger_state.setText(text)
+        self._show_trigger_wait_dialog(
+            title="触发采集中",
+            detail_text=text,
+            progress_value=captured,
+            progress_total=total)
+        QApplication.processEvents()
+
     def _arm_trigger_capture(self, *_):
         if not self._chk_trigger_enable.isChecked():
             return
 
+        self._waveform_import_mode = False
         total, pre = self._trigger_sample_counts()
         self._trigger_total_samples = total
         self._trigger_pre_samples = pre
@@ -617,6 +740,7 @@ class MainWindow(QMainWindow):
         self._trigger_capture_frames = []
         self._trigger_prev_value = None
         self._trigger_sample_index = None
+        self._trigger_sample_channel = None
         self._trigger_armed = True
         self._trigger_capturing = False
 
@@ -632,7 +756,7 @@ class MainWindow(QMainWindow):
         self._lbl_trigger_state.setText(
             f"触发采集中: 等待 CH{ch + 1} {mode_text} 阈值 {threshold:.6g}")
         self._statusbar.showMessage("触发采集中: 已布防", 1500)
-        self._show_trigger_wait_dialog()
+        self._show_trigger_wait_dialog(detail_text=self._lbl_trigger_state.text())
 
     def _process_trigger_frames(self, frames):
         if not self._chk_trigger_enable.isChecked():
@@ -654,14 +778,15 @@ class MainWindow(QMainWindow):
 
             value = float(frame[source_ch])
             if self._trigger_condition_met(self._trigger_prev_value, value):
-                self._hide_trigger_wait_dialog()
                 self._trigger_capturing = True
                 self._trigger_armed = False
                 self._trigger_capture_frames = list(self._trigger_pre_buffer)
                 self._trigger_sample_index = len(self._trigger_capture_frames)
+                self._trigger_sample_channel = source_ch
                 self._trigger_capture_frames.append(frame)
                 self._trigger_pre_buffer.clear()
                 self._trigger_prev_value = value
+                self._update_trigger_capture_progress_dialog(force=True)
                 if self._trigger_capture_complete():
                     break
             else:
@@ -669,13 +794,11 @@ class MainWindow(QMainWindow):
                 self._trigger_prev_value = value
 
         if self._trigger_capturing:
-            captured = min(len(self._trigger_capture_frames),
-                           self._trigger_total_samples)
-            self._lbl_trigger_state.setText(
-                f"触发采集中: 捕获中 {captured}/{self._trigger_total_samples}")
+            self._update_trigger_capture_progress_dialog(force=True)
 
     def _append_trigger_capture_frame(self, frame):
         self._trigger_capture_frames.append(frame)
+        self._update_trigger_capture_progress_dialog()
         return self._trigger_capture_complete()
 
     def _trigger_capture_complete(self):
@@ -689,13 +812,11 @@ class MainWindow(QMainWindow):
         self._trigger_capture_frames = captured
 
         self._hide_trigger_wait_dialog()
-        self._waveform.set_follow_latest_enabled(True)
-        self._waveform.clear_data()
-        self._waveform.add_data_points(captured)
-        self._waveform._on_refresh_tick()
+        self._load_trigger_waveform_with_progress(captured)
         if self._trigger_sample_index is not None:
             trigger_index = min(self._trigger_sample_index, len(captured) - 1)
-            self._waveform.set_trigger_marker_sample_index(trigger_index)
+            self._waveform.set_trigger_marker_sample_index(
+                trigger_index, self._trigger_sample_channel)
         self._waveform.set_follow_latest_enabled(False)
 
         self._lbl_trigger_state.setText(
@@ -703,6 +824,38 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage(
             f"触发采样完成: {len(captured)} 点", 3000)
         return True
+
+    def _load_trigger_waveform_with_progress(self, frames):
+        total = len(frames)
+        progress = QProgressDialog("正在加载触发波形...", "", 0,
+                                   max(total, 1), self)
+        progress.setWindowTitle("加载波形")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        try:
+            self._waveform.set_follow_latest_enabled(True)
+            self._waveform.clear_data()
+            if total <= 0:
+                return
+
+            chunk_size = max(1000, min(50000, int(math.ceil(total / 100.0))))
+            for start in range(0, total, chunk_size):
+                end = min(start + chunk_size, total)
+                self._waveform.add_data_points(frames[start:end])
+                progress.setLabelText(f"正在加载触发波形... {end}/{total}")
+                progress.setValue(end)
+                QApplication.processEvents()
+
+            self._waveform._on_refresh_tick()
+        finally:
+            progress.setValue(max(total, 1))
+            progress.close()
 
     def _trigger_condition_met(self, previous, current):
         threshold = self._spin_trigger_threshold.value()
@@ -717,6 +870,392 @@ class MainWindow(QMainWindow):
         if mode == "falling":
             return previous > threshold >= current
         return previous < threshold <= current
+
+    # ─── 波形保存 ─────────────────────────────────────────────
+
+    def _save_current_waveform(self):
+        if self._trigger_capture_ready():
+            self._save_trigger_waveform()
+        else:
+            self._save_live_waveform()
+
+    def _trigger_capture_ready(self):
+        return (
+            bool(self._trigger_capture_frames) and
+            not self._trigger_capturing and
+            not self._trigger_armed
+        )
+
+    def _exit_waveform_import_mode(self):
+        self._waveform_import_mode = False
+
+    def _save_live_waveform(self):
+        data = self._waveform.get_sample_data()
+        rows = data.get('rows', [])
+        if not rows:
+            self._show_error("没有可保存的连续采样波形")
+            return
+
+        interval_ms = data.get('sample_interval_ms',
+                               self._device_frame_period_ms)
+        export_rows = [
+            (sample_index, sample_index * interval_ms, values)
+            for sample_index, values in rows
+        ]
+        self._save_waveform_csv(
+            "连续采样", export_rows, data.get('channel_configs', []),
+            interval_ms)
+
+    def _save_trigger_waveform(self):
+        if self._trigger_capturing:
+            self._show_error("触发采样尚未完成")
+            return
+        if not self._trigger_capture_frames:
+            self._show_error("没有可保存的触发采样波形")
+            return
+
+        channel_count = min(
+            self._channel_config.channel_count(),
+            max(len(frame) for frame in self._trigger_capture_frames))
+        configs = [
+            self._channel_config.get_channel_config(ch)
+            for ch in range(channel_count)
+        ]
+        interval_ms = max(float(self._device_frame_period_ms), 0.001)
+        trigger_index = (
+            self._trigger_sample_index
+            if self._trigger_sample_index is not None else 0)
+        trigger_channel = (
+            self._trigger_sample_channel
+            if self._trigger_sample_channel is not None else
+            self._trigger_source_channel())
+
+        export_rows = []
+        for sample_index, frame in enumerate(self._trigger_capture_frames):
+            values = [
+                frame[ch] if ch < len(frame) else None
+                for ch in range(channel_count)
+            ]
+            time_ms = (sample_index - trigger_index) * interval_ms
+            export_rows.append((sample_index, time_ms, values))
+
+        self._save_waveform_csv(
+            "触发采样", export_rows, configs, interval_ms,
+            trigger_index=trigger_index,
+            trigger_channel=trigger_channel)
+
+    def _save_waveform_csv(self, sample_type, rows, channel_configs,
+                           interval_ms, trigger_index=None,
+                           trigger_channel=None):
+        path = self._ask_waveform_save_path()
+        if not path:
+            return
+
+        try:
+            self._write_waveform_csv(
+                path, sample_type, rows, channel_configs,
+                interval_ms, trigger_index, trigger_channel)
+        except OSError as exc:
+            self._show_error(f"保存失败: {exc}")
+            return
+
+        self._save_dir = os.path.dirname(path) or self._save_dir
+        self._record_waveform_save(path)
+        self._statusbar.showMessage(f"波形已保存: {path}", 5000)
+
+    def _ask_waveform_save_path(self):
+        default_path = self._next_default_save_path()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存波形数据", default_path,
+            "CSV Files (*.csv);;All Files (*)")
+        if not path:
+            return ""
+        root, ext = os.path.splitext(path)
+        if not ext:
+            path = root + ".csv"
+        return path
+
+    def _next_default_save_path(self):
+        directory = self._save_dir if os.path.isdir(self._save_dir) else os.getcwd()
+        date_text = datetime.now().strftime("%Y%m%d")
+        file_seq = self._next_daily_save_sequence(directory, date_text)
+        runtime_seq = self._save_sequence_by_date.get(date_text, 0) + 1
+        seq = max(file_seq, runtime_seq)
+        self._pending_save_date = date_text
+        self._pending_save_sequence = seq
+        return os.path.join(directory, f"Data{seq}_{date_text}.csv")
+
+    def _record_waveform_save(self, path):
+        date_text = datetime.now().strftime("%Y%m%d")
+        seq = self._pending_save_sequence or 0
+
+        file_seq = self._sequence_from_save_name(path, date_text)
+        if file_seq is not None:
+            seq = max(seq, file_seq)
+
+        if self._pending_save_date and self._pending_save_date != date_text:
+            date_text = self._pending_save_date
+        self._save_sequence_by_date[date_text] = max(
+            self._save_sequence_by_date.get(date_text, 0), seq)
+        self._pending_save_date = None
+        self._pending_save_sequence = None
+
+    @staticmethod
+    def _next_daily_save_sequence(directory, date_text):
+        pattern = re.compile(
+            rf"^Data(\d+)_{re.escape(date_text)}(?:\D.*)?\.csv$",
+            re.IGNORECASE)
+        max_seq = 0
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            names = []
+        for name in names:
+            match = pattern.match(name)
+            if not match:
+                continue
+            max_seq = max(max_seq, int(match.group(1)))
+        return max_seq + 1
+
+    @staticmethod
+    def _sequence_from_save_name(path, date_text):
+        pattern = re.compile(
+            rf"^Data(\d+)_{re.escape(date_text)}(?:\D.*)?\.csv$",
+            re.IGNORECASE)
+        match = pattern.match(os.path.basename(path))
+        if not match:
+            return None
+        return int(match.group(1))
+
+    @staticmethod
+    def _channel_csv_header(ch_idx, config):
+        name = config.get('name') or f"CH{ch_idx + 1}"
+        unit = config.get('unit') or ""
+        if unit:
+            return f"CH{ch_idx + 1}:{name}({unit})"
+        return f"CH{ch_idx + 1}:{name}"
+
+    def _write_waveform_csv(self, path, sample_type, rows, channel_configs,
+                            interval_ms, trigger_index=None,
+                            trigger_channel=None):
+        saved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        headers = ["Sample", "Time_ms"]
+        headers.extend(
+            self._channel_csv_header(ch_idx, config)
+            for ch_idx, config in enumerate(channel_configs))
+
+        with open(path, "w", newline="", encoding="utf-8-sig") as file_obj:
+            writer = csv.writer(file_obj)
+            writer.writerow(["Type", sample_type])
+            writer.writerow(["SavedAt", saved_at])
+            writer.writerow(["SampleIntervalMs", f"{interval_ms:.12g}"])
+            if trigger_index is not None:
+                writer.writerow(["TriggerSampleIndex", trigger_index])
+            if trigger_channel is not None:
+                writer.writerow(["TriggerChannelIndex", int(trigger_channel)])
+            writer.writerow([])
+            writer.writerow(headers)
+            for sample_index, time_ms, values in rows:
+                row = [sample_index, f"{time_ms:.12g}"]
+                for value in values[:len(channel_configs)]:
+                    if value is None:
+                        row.append("")
+                    else:
+                        row.append(f"{float(value):.12g}")
+                writer.writerow(row)
+
+    def _import_waveform_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入波形数据", self._save_dir,
+            "CSV Files (*.csv);;All Files (*)")
+        if not path:
+            return
+
+        try:
+            imported = self._read_waveform_csv(path)
+        except (OSError, ValueError) as exc:
+            self._show_error(f"导入失败: {exc}")
+            return
+
+        frames = imported['frames']
+        channel_configs = imported['channel_configs']
+        if not frames or not channel_configs:
+            self._show_error("导入文件中没有有效波形数据")
+            return
+
+        if self._chk_trigger_enable.isChecked():
+            self._chk_trigger_enable.setChecked(False)
+        else:
+            self._reset_trigger_capture_state()
+
+        channel_count = len(channel_configs)
+        self._channel_config.set_channel_count(channel_count)
+        for ch_idx, config in enumerate(channel_configs):
+            self._channel_config.set_channel_config(ch_idx, config)
+
+        self._device_frame_period_ms = imported['sample_interval_ms']
+        self._spin_frame_period.blockSignals(True)
+        self._spin_frame_period.setValue(self._device_frame_period_ms)
+        self._spin_frame_period.blockSignals(False)
+        self._sync_parser_channel_types()
+        self._waveform.load_sample_data(
+            frames,
+            sample_interval_ms=imported['sample_interval_ms'],
+            channel_configs=channel_configs,
+            trigger_index=imported.get('trigger_index'),
+            trigger_channel=imported.get('trigger_channel'),
+            follow_latest=False)
+        self._waveform.set_active_channel_count(channel_count)
+        self._waveform_import_mode = True
+        self._latest_channel_values = frames[-1]
+        self._channel_config.set_channel_values(frames[-1])
+        self._save_dir = os.path.dirname(path) or self._save_dir
+        self._lbl_trigger_state.setText("触发: 导入数据"
+                                        if imported.get('trigger_index') is not None
+                                        else "触发: 关闭")
+        self._statusbar.showMessage(f"波形已导入: {path}", 5000)
+
+    def _read_waveform_csv(self, path):
+        metadata = {}
+        headers = None
+        data_rows = []
+
+        with open(path, "r", newline="", encoding="utf-8-sig") as file_obj:
+            reader = csv.reader(file_obj)
+            for row in reader:
+                if not row or all(not cell.strip() for cell in row):
+                    continue
+                first = row[0].strip()
+                if headers is None and first == "Sample":
+                    headers = row
+                    continue
+                if headers is None:
+                    if len(row) >= 2:
+                        metadata[first] = row[1].strip()
+                    continue
+                data_rows.append(row)
+
+        if headers is None or len(headers) < 3:
+            raise ValueError("未找到 Sample/Time_ms 数据表头")
+
+        channel_headers = headers[2:]
+        channel_configs = [
+            self._parse_import_channel_header(idx, header)
+            for idx, header in enumerate(channel_headers)
+        ]
+
+        frames = []
+        times_ms = []
+        for row in data_rows:
+            if len(row) < 2:
+                continue
+            try:
+                times_ms.append(float(row[1]))
+            except (TypeError, ValueError):
+                times_ms.append(float(len(times_ms)))
+
+            values = []
+            for cell in row[2:2 + len(channel_configs)]:
+                cell = cell.strip()
+                if not cell:
+                    values.append(float('nan'))
+                    continue
+                try:
+                    values.append(float(cell))
+                except ValueError:
+                    values.append(float('nan'))
+            if len(values) < len(channel_configs):
+                values.extend([float('nan')] *
+                              (len(channel_configs) - len(values)))
+            frames.append(values)
+
+        interval_ms = self._import_sample_interval(metadata, times_ms)
+        trigger_index = None
+        if metadata.get("TriggerSampleIndex"):
+            try:
+                trigger_index = int(float(metadata["TriggerSampleIndex"]))
+            except ValueError:
+                trigger_index = None
+        trigger_channel = None
+        if metadata.get("TriggerChannelIndex"):
+            try:
+                trigger_channel = int(float(metadata["TriggerChannelIndex"]))
+            except ValueError:
+                trigger_channel = None
+        if trigger_channel is not None:
+            trigger_channel = max(
+                0, min(trigger_channel, len(channel_configs) - 1))
+
+        return {
+            'frames': frames,
+            'channel_configs': channel_configs,
+            'sample_interval_ms': interval_ms,
+            'trigger_index': trigger_index,
+            'trigger_channel': trigger_channel,
+        }
+
+    def _parse_import_channel_header(self, ch_idx, header):
+        current = self._channel_config.get_channel_config(ch_idx)
+        config = dict(current) if current else {}
+        config.setdefault('name', f"CH{ch_idx + 1}")
+        config.setdefault('unit', '')
+        config.setdefault('visible', True)
+        config.setdefault('data_type', 'int16')
+        config.setdefault('color', self._waveform.get_channel_config(
+            ch_idx).get('color') if self._waveform.get_channel_config(ch_idx)
+            else '#FF4444')
+
+        text = (header or "").strip()
+        match = re.match(r"^CH\d+\s*:\s*(.*)$", text)
+        if match:
+            text = match.group(1).strip()
+        unit_match = re.match(r"^(.*)\(([^()]*)\)$", text)
+        if unit_match:
+            config['name'] = unit_match.group(1).strip() or config['name']
+            config['unit'] = unit_match.group(2).strip()
+        elif text:
+            config['name'] = text
+        return config
+
+    def _import_sample_interval(self, metadata, times_ms):
+        value = metadata.get("SampleIntervalMs")
+        if value:
+            try:
+                return max(0.001, float(value))
+            except ValueError:
+                pass
+        if len(times_ms) >= 2:
+            diffs = [
+                times_ms[i + 1] - times_ms[i]
+                for i in range(len(times_ms) - 1)
+                if times_ms[i + 1] != times_ms[i]
+            ]
+            if diffs:
+                return max(0.001, abs(diffs[0]))
+        return max(float(self._device_frame_period_ms), 0.001)
+
+    def _toggle_channel_panel(self):
+        visible = not self._channel_panel_visible
+        self._set_channel_panel_visible(visible)
+
+    def _set_channel_panel_visible(self, visible):
+        self._channel_panel_visible = bool(visible)
+        sizes = self._h_splitter.sizes()
+        if not visible:
+            if len(sizes) > 1 and sizes[1] > 0:
+                self._channel_panel_last_width = sizes[1]
+            self._right_panel.setVisible(False)
+            if sizes:
+                self._h_splitter.setSizes([sum(sizes), 0])
+            self._btn_toggle_channel_panel.setText("显示配置")
+            return
+
+        self._right_panel.setVisible(True)
+        total = sum(sizes) if sizes else self.width()
+        panel_width = max(420, self._channel_panel_last_width)
+        wave_width = max(400, total - panel_width)
+        self._h_splitter.setSizes([wave_width, panel_width])
+        self._btn_toggle_channel_panel.setText("隐藏配置")
 
     def _refresh_ports(self):
         self._combo_port.clear()
@@ -837,6 +1376,7 @@ class MainWindow(QMainWindow):
             cursor.removeSelectedText()
 
     def _clear_rx_display(self):
+        self._waveform_import_mode = False
         self._text_rx.clear()
         self._rx_text_buffer.clear()
         self._rx_text_pending_chars = 0
@@ -870,6 +1410,9 @@ class MainWindow(QMainWindow):
         frame_count = len(frames)
         self._frame_count += frame_count
         self._fps_timer_count += frame_count
+        if self._waveform_import_mode:
+            self._live_ui_dirty = True
+            return
         self._latest_channel_values = frames[-1]
         self._live_ui_dirty = True
         self._process_trigger_frames(frames)
@@ -906,15 +1449,47 @@ class MainWindow(QMainWindow):
                 f"解析错误: {self._last_parse_error_msg}", 3000)
 
     def _on_channel_config_changed(self, ch_idx, config):
+        if ch_idx >= self._waveform.channel_count():
+            self._waveform.set_channel_count(ch_idx + 1)
         self._waveform.set_channel_name(ch_idx, config['name'])
         self._waveform.set_channel_color(ch_idx, config['color'])
         self._waveform.set_channel_visible(ch_idx, config['visible'])
         self._waveform.set_channel_unit(ch_idx, config.get('unit', ''))
         self._refresh_trigger_channel_combo()
+        if ch_idx >= len(self._channel_data_types):
+            self._sync_parser_channel_types()
+            self._update_sample_interval()
+            return
+
         if config['data_type'] != self._channel_data_types[ch_idx]:
             self._channel_data_types[ch_idx] = config['data_type']
             self._parser.set_channel_data_type(ch_idx, config['data_type'])
             self._update_sample_interval()
+
+    def _on_channel_count_changed(self, count):
+        self._spin_channels.blockSignals(True)
+        self._spin_channels.setValue(count)
+        self._spin_channels.blockSignals(False)
+
+        self._waveform.set_channel_count(count)
+        self._waveform.set_active_channel_count(count)
+        for ch_idx, config in enumerate(self._channel_config.get_all_configs()):
+            self._waveform.set_channel_name(ch_idx, config['name'])
+            self._waveform.set_channel_color(ch_idx, config['color'])
+            self._waveform.set_channel_visible(ch_idx, config['visible'])
+            self._waveform.set_channel_unit(ch_idx, config.get('unit', ''))
+
+        self._sync_parser_channel_types()
+        self._refresh_trigger_channel_combo(count)
+        self._latest_channel_values = None
+        self._channel_config.set_channel_values([])
+        self._update_sample_interval()
+
+    def _sync_parser_channel_types(self):
+        configs = self._channel_config.get_all_configs()
+        data_types = [cfg.get('data_type', 'int16') for cfg in configs]
+        self._parser.set_channel_data_types(data_types)
+        self._channel_data_types = self._parser.data_types
 
     def _on_format_detected(self, num_ch, data_len):
         """解析器自动检测到帧格式"""
@@ -951,14 +1526,12 @@ class MainWindow(QMainWindow):
     def _on_frame_period_changed(self, value):
         self._device_frame_period_ms = float(value)
         self._update_sample_interval()
+        self._reset_trigger_after_setting_change()
 
     def _update_sample_interval(self):
         """根据波特率和帧大小计算每帧时间间隔, 更新X轴刻度"""
         self._waveform.set_sample_interval_ms(self._device_frame_period_ms)
         self._update_trigger_sample_count_label()
-        if (hasattr(self, '_chk_trigger_enable') and
-                self._chk_trigger_enable.isChecked()):
-            self._arm_trigger_capture()
 
     # ─── 状态更新 ─────────────────────────────────────────────
 
@@ -967,6 +1540,7 @@ class MainWindow(QMainWindow):
         self._combo_port.setEnabled(not connected)
         self._btn_refresh.setEnabled(not connected)
         if connected:
+            self._waveform_import_mode = False
             self._update_sample_interval()
             self._channel_config.set_channel_values([])
             self._waveform.clear_data()

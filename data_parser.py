@@ -39,6 +39,7 @@ DEFAULT_SEGMENT_TYPES = [
     'int32', 'int32', 'int16', 'int16', 'int16',
 ]
 
+DEFAULT_CHANNEL_COUNT = 6
 NUM_SEGMENTS = len(DEFAULT_SEGMENT_TYPES)
 HEADER_BYTES = bytes((0xAA, 0xFF, 0xF1))
 HEADER_LEN = 4
@@ -46,6 +47,10 @@ CHECKSUM_LEN = 2
 MIN_FRAME_LEN = HEADER_LEN + CHECKSUM_LEN
 DATA_BYTES = sum(DATA_TYPE_DEFS[t][0] for t in DEFAULT_SEGMENT_TYPES)
 FRAME_LEN = HEADER_LEN + DATA_BYTES + CHECKSUM_LEN
+
+
+def default_segment_type(ch_idx):
+    return DEFAULT_SEGMENT_TYPES[ch_idx % len(DEFAULT_SEGMENT_TYPES)]
 
 
 class DataParser(QObject):
@@ -61,12 +66,13 @@ class DataParser(QObject):
     ADDR = 0xFF
     PKT_ID = 0xF1
 
-    def __init__(self):
+    def __init__(self, num_channels=DEFAULT_CHANNEL_COUNT):
         super().__init__()
         self._buffer = bytearray()
-        self._num_channels = NUM_SEGMENTS
-        self._data_types = list(DEFAULT_SEGMENT_TYPES)
-        self._data_length = DATA_BYTES
+        self._num_channels = max(1, int(num_channels))
+        self._data_types = [
+            default_segment_type(i) for i in range(self._num_channels)]
+        self._data_length = self.data_bytes
         self._reported_format = None
         self._checksum_enabled = True
 
@@ -104,8 +110,38 @@ class DataParser(QObject):
 
     def set_channel_data_types(self, data_types):
         """Set channel types in bulk."""
-        for i, data_type in enumerate(data_types[:self._num_channels]):
-            self.set_channel_data_type(i, data_type)
+        if not data_types:
+            return
+
+        next_types = []
+        for data_type in data_types:
+            if data_type not in DATA_TYPE_DEFS:
+                self.parse_error.emit(f"Unknown data type: {data_type}")
+                data_type = default_segment_type(len(next_types))
+            next_types.append(data_type)
+
+        self._num_channels = len(next_types)
+        self._data_types = next_types
+        self._data_length = self.data_bytes
+        self._reported_format = None
+        self._buffer.clear()
+
+    def set_channel_count(self, count):
+        """Adjust the configured channel count while preserving known types."""
+        count = max(1, int(count))
+        if count == self._num_channels:
+            return
+
+        if count > self._num_channels:
+            for ch_idx in range(self._num_channels, count):
+                self._data_types.append(default_segment_type(ch_idx))
+        else:
+            del self._data_types[count:]
+
+        self._num_channels = count
+        self._data_length = self.data_bytes
+        self._reported_format = None
+        self._buffer.clear()
 
     def set_checksum_enabled(self, enabled):
         self._checksum_enabled = bool(enabled)
@@ -208,12 +244,9 @@ class DataParser(QObject):
             values.append(float(struct.unpack(fmt, raw)[0]))
             offset += size
 
-        if offset < payload_len:
-            self.parse_error.emit(
-                f"Len 0x{payload_len:02X} has "
-                f"{payload_len - offset} byte(s) beyond configured channels")
-            return None
-
+        # The UI can intentionally configure fewer channels than the device
+        # sends. Keep the visible/configured channels flowing and ignore the
+        # remaining payload bytes instead of dropping the whole frame.
         return values
 
     @classmethod
