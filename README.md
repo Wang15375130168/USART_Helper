@@ -2,6 +2,8 @@
 
 USART Helper 是一款面向嵌入式调试场景的 Windows 串口波形分析工具。软件用于接收设备通过 USART/串口输出的二进制采样帧，实时解析多通道数据，并提供连续采样、触发采样、波形保存/导入、游标测量和通道配置等功能。
 
+注：项目中已经编译完成安装包目录为：".\USART_Helper\installer_output\USART_Helper_Setup.exe"
+
 ## 主要功能
 
 - 串口连接：支持端口选择、刷新、波特率、数据位、停止位、校验位配置。
@@ -275,6 +277,7 @@ installer_output\USART_Helper_Setup.exe
 目标电脑不需要安装 Python 或 Inno Setup，只需要具备串口设备对应的系统驱动。
 
 更详细的打包说明见 [PACKAGING.md](PACKAGING.md)。
+
 注：项目中已经编译完成安装包目录为：".\USART_Helper\installer_output\USART_Helper_Setup.exe"
 ## 项目结构
 
