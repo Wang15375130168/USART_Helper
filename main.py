@@ -15,15 +15,21 @@
 依赖:
   pip install PyQt5 pyqtgraph pyserial numpy
 """
+import os
 import sys
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QIcon
 
 # 启用高DPI缩放支持 (必须在 QApplication 创建前设置)
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 from main_window import MainWindow
+
+
+def resource_path(relative_path):
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 
 def main():
@@ -32,6 +38,10 @@ def main():
     # 设置全局字体
     font = QFont("Microsoft YaHei", 10)
     app.setFont(font)
+
+    icon_path = resource_path(os.path.join("assets", "app_icon.ico"))
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
     # 设置深色主题样式
     app.setStyleSheet("""
@@ -139,6 +149,8 @@ def main():
     """)
 
     window = MainWindow()
+    if not app.windowIcon().isNull():
+        window.setWindowIcon(app.windowIcon())
     window.show()
     sys.exit(app.exec_())
 

@@ -644,6 +644,8 @@ class MainWindow(QMainWindow):
         self._trigger_sample_index = None
         self._trigger_sample_channel = None
         self._hide_trigger_wait_dialog()
+        if hasattr(self, '_waveform'):
+            self._waveform.clear_trigger_marker()
 
     def _show_trigger_wait_dialog(self, title="触发采样中",
                                   detail_text="正在等待触发条件...",

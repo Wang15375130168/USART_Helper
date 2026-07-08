@@ -12,7 +12,9 @@ a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ("assets/app_icon.ico", "assets"),
+    ],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -45,6 +47,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    icon="assets/app_icon.ico",
 )
 
 coll = COLLECT(
