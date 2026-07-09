@@ -900,13 +900,15 @@ class MainWindow(QMainWindow):
 
         interval_ms = data.get('sample_interval_ms',
                                self._device_frame_period_ms)
+        channel_configs = self._export_channel_configs(
+            len(data.get('channel_configs', [])),
+            data.get('channel_configs', []))
         export_rows = [
             (sample_index, sample_index * interval_ms, values)
             for sample_index, values in rows
         ]
         self._save_waveform_csv(
-            "连续采样", export_rows, data.get('channel_configs', []),
-            interval_ms)
+            "连续采样", export_rows, channel_configs, interval_ms)
 
     def _save_trigger_waveform(self):
         if self._trigger_capturing:
@@ -1037,6 +1039,45 @@ class MainWindow(QMainWindow):
             return f"CH{ch_idx + 1}:{name}({unit})"
         return f"CH{ch_idx + 1}:{name}"
 
+    def _export_channel_configs(self, channel_count, fallback_configs=None):
+        fallback_configs = fallback_configs or []
+        configs = []
+        for ch_idx in range(channel_count):
+            fallback = (
+                fallback_configs[ch_idx]
+                if ch_idx < len(fallback_configs) else {})
+            config = dict(fallback)
+            panel_config = self._channel_config.get_channel_config(ch_idx)
+            if panel_config:
+                config.update(panel_config)
+            config.setdefault('name', f"CH{ch_idx + 1}")
+            config.setdefault('unit', '')
+            config.setdefault('visible', True)
+            config.setdefault('color', '#FF4444')
+            config.setdefault('data_type', 'int16')
+            configs.append(config)
+        return configs
+
+    @staticmethod
+    def _metadata_bool_text(value):
+        return "1" if bool(value) else "0"
+
+    def _write_channel_config_metadata(self, writer, channel_configs):
+        writer.writerow(["ChannelConfigVersion", "1"])
+        writer.writerow(["ChannelCount", len(channel_configs)])
+        for ch_idx, config in enumerate(channel_configs, start=1):
+            prefix = f"Channel{ch_idx}"
+            writer.writerow([
+                f"{prefix}Name", config.get('name') or f"CH{ch_idx}"])
+            writer.writerow([f"{prefix}Unit", config.get('unit') or ""])
+            writer.writerow([f"{prefix}Color", config.get('color') or ""])
+            writer.writerow([
+                f"{prefix}Visible",
+                self._metadata_bool_text(config.get('visible', True))])
+            writer.writerow([
+                f"{prefix}DataType",
+                config.get('data_type') or "int16"])
+
     def _write_waveform_csv(self, path, sample_type, rows, channel_configs,
                             interval_ms, trigger_index=None,
                             trigger_channel=None):
@@ -1051,6 +1092,7 @@ class MainWindow(QMainWindow):
             writer.writerow(["Type", sample_type])
             writer.writerow(["SavedAt", saved_at])
             writer.writerow(["SampleIntervalMs", f"{interval_ms:.12g}"])
+            self._write_channel_config_metadata(writer, channel_configs)
             if trigger_index is not None:
                 writer.writerow(["TriggerSampleIndex", trigger_index])
             if trigger_channel is not None:
@@ -1145,6 +1187,7 @@ class MainWindow(QMainWindow):
             self._parse_import_channel_header(idx, header)
             for idx, header in enumerate(channel_headers)
         ]
+        self._apply_import_channel_metadata(channel_configs, metadata)
 
         frames = []
         times_ms = []
@@ -1218,6 +1261,42 @@ class MainWindow(QMainWindow):
         elif text:
             config['name'] = text
         return config
+
+    @staticmethod
+    def _parse_metadata_bool(value, default=True):
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "on", "visible", "show"):
+            return True
+        if text in ("0", "false", "no", "off", "hidden", "hide"):
+            return False
+        return default
+
+    def _apply_import_channel_metadata(self, channel_configs, metadata):
+        for ch_idx, config in enumerate(channel_configs):
+            prefix = f"Channel{ch_idx + 1}"
+
+            name_key = f"{prefix}Name"
+            if name_key in metadata and metadata[name_key]:
+                config['name'] = metadata[name_key]
+
+            unit_key = f"{prefix}Unit"
+            if unit_key in metadata:
+                config['unit'] = metadata[unit_key]
+
+            color_key = f"{prefix}Color"
+            color = metadata.get(color_key, "").strip()
+            if re.match(r"^#[0-9A-Fa-f]{6}$", color):
+                config['color'] = color
+
+            visible_key = f"{prefix}Visible"
+            if visible_key in metadata:
+                config['visible'] = self._parse_metadata_bool(
+                    metadata[visible_key], config.get('visible', True))
+
+            data_type_key = f"{prefix}DataType"
+            data_type = metadata.get(data_type_key, "").strip()
+            if data_type:
+                config['data_type'] = data_type
 
     def _import_sample_interval(self, metadata, times_ms):
         value = metadata.get("SampleIntervalMs")
@@ -1550,6 +1629,7 @@ class MainWindow(QMainWindow):
                 self._arm_trigger_capture()
             else:
                 self._reset_trigger_capture_state()
+                self._waveform.set_follow_latest_enabled(True)
 
             self._btn_connect.setText("关闭串口")
             self._btn_connect.setStyleSheet(
@@ -1557,6 +1637,7 @@ class MainWindow(QMainWindow):
                 "font-weight: bold; padding: 6px 16px; font-size: 13px; }"
                 "QPushButton:hover { background-color: #D32F2F; }")
         else:
+            self._waveform.set_follow_latest_enabled(False)
             self._btn_connect.setText("打开串口")
             self._btn_connect.setStyleSheet(
                 "QPushButton { background-color: #2E7D32; color: white; "

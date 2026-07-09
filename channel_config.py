@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QColorDialog, QScrollArea, QGroupBox, QComboBox, QSizePolicy
 )
 from PyQt5.QtCore import pyqtSignal, Qt
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QFont
 
 DATA_TYPE_OPTIONS = [
     ('int8', 'int8'),
@@ -33,6 +33,8 @@ DEFAULT_COLORS = [
 
 DEFAULT_CHANNEL_COUNT = 6
 MAX_CHANNEL_COUNT = 64
+ROW_FONT_POINT_SIZE = 10
+ROW_CONTROL_HEIGHT = 24
 
 
 def default_data_type(ch_idx):
@@ -205,7 +207,38 @@ class ChannelConfigPanel(QWidget):
         self._grid.addWidget(unit_edit, row, 6)
         widgets['unit'] = unit_edit
 
+        self._apply_row_widget_metrics(widgets)
         self._channel_widgets.append(widgets)
+
+    def _row_font(self, monospace=False):
+        font = QFont(self.font())
+        font.setPointSize(ROW_FONT_POINT_SIZE)
+        if monospace:
+            font.setFamily("Consolas")
+        return font
+
+    def _apply_row_widget_metrics(self, widgets):
+        text_font = self._row_font()
+        value_font = self._row_font(monospace=True)
+        for key in ('ch_btn', 'name', 'color_btn', 'data_type', 'unit'):
+            widget = widgets.get(key)
+            if widget is None:
+                continue
+            widget.setFont(text_font)
+            widget.setMinimumHeight(ROW_CONTROL_HEIGHT)
+            widget.setMaximumHeight(ROW_CONTROL_HEIGHT)
+
+        value_label = widgets.get('value')
+        if value_label is not None:
+            value_label.setFont(value_font)
+            value_label.setMinimumHeight(ROW_CONTROL_HEIGHT)
+            value_label.setMaximumHeight(ROW_CONTROL_HEIGHT)
+
+        visible = widgets.get('visible')
+        if visible is not None:
+            visible.setFont(text_font)
+            visible.setMinimumHeight(ROW_CONTROL_HEIGHT)
+            visible.setMaximumHeight(ROW_CONTROL_HEIGHT)
 
     @staticmethod
     def _ch_btn_style(color, selected=False):
@@ -214,6 +247,7 @@ class ChannelConfigPanel(QWidget):
             return (
                 f"QPushButton {{ background-color: {color}; "
                 f"color: white; font-weight: bold; "
+                f"font-size: {ROW_FONT_POINT_SIZE}pt; "
                 f"border: 2px solid white; border-radius: 3px; "
                 f"padding: 2px 8px; }}"
             )
@@ -221,6 +255,7 @@ class ChannelConfigPanel(QWidget):
             return (
                 f"QPushButton {{ background-color: #3C3C3C; "
                 f"color: {color}; font-weight: bold; "
+                f"font-size: {ROW_FONT_POINT_SIZE}pt; "
                 f"border: 1px solid {color}; border-radius: 3px; "
                 f"padding: 2px 8px; }}"
                 f"QPushButton:hover {{ background-color: #4A4A4A; }}"

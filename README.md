@@ -212,6 +212,9 @@ CSV 元数据包含：
 - `Type`：连续采样或触发采样。
 - `SavedAt`：保存时间。
 - `SampleIntervalMs`：采样间隔。
+- `ChannelConfigVersion`：通道配置元数据版本。
+- `ChannelCount`：保存的通道数量。
+- `ChannelNName` / `ChannelNUnit` / `ChannelNColor` / `ChannelNVisible` / `ChannelNDataType`：第 N 个通道的名称、单位、颜色、显示状态和数据类型。
 - `TriggerSampleIndex`：触发采样点索引，仅触发采样保存。
 - `TriggerChannelIndex`：触发源通道索引，仅触发采样保存。
 
@@ -303,5 +306,6 @@ USART_Helper/
 - 高速串口采样时，建议先确认设备输出帧格式和通道数据类型一致。
 - 如果波形显示异常，优先检查 `Len`、通道数据类型、通道数量和校验字节。
 - 触发采样修改触发源、阈值、预触发比例等参数后，不会自动重新触发，需要点击“重新触发”。
+- 导入新版 CSV 时，通道名称、单位、颜色、显示状态和数据类型会随波形数据自动恢复。
 - 导入触发采样 CSV 时，如果文件包含 `TriggerChannelIndex`，触发点会恢复到原触发源通道。
 - 目标电脑运行打包版时不需要 Python，但串口芯片驱动仍需按硬件要求安装。
