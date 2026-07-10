@@ -501,6 +501,8 @@ class MainWindow(QMainWindow):
             self._on_channel_count_changed)
         self._channel_config.channel_selected.connect(
             self._waveform.select_channel)
+        self._channel_config.y_link_channels_changed.connect(
+            self._waveform.set_y_link_channels)
         self._waveform.buffer_size_changed.connect(
             self._on_buffer_size_changed)
         self._waveform._btn_clear.clicked.connect(
@@ -849,7 +851,8 @@ class MainWindow(QMainWindow):
             chunk_size = max(1000, min(50000, int(math.ceil(total / 100.0))))
             for start in range(0, total, chunk_size):
                 end = min(start + chunk_size, total)
-                self._waveform.add_data_points(frames[start:end])
+                self._waveform.add_data_points(
+                    frames[start:end], ignore_pause=True)
                 progress.setLabelText(f"正在加载触发波形... {end}/{total}")
                 progress.setValue(end)
                 QApplication.processEvents()

@@ -54,6 +54,8 @@ class ChannelConfigPanel(QWidget):
     channel_selected = pyqtSignal(int)
     # 通道数量变化信号
     channel_count_changed = pyqtSignal(int)
+    # Y轴联动通道变化信号
+    y_link_channels_changed = pyqtSignal(list)
 
     def __init__(self, num_channels=DEFAULT_CHANNEL_COUNT,
                  max_channels=MAX_CHANNEL_COUNT, parent=None):
@@ -87,14 +89,15 @@ class ChannelConfigPanel(QWidget):
         self._grid.setSpacing(6)
         self._grid.setColumnStretch(0, 0)
         self._grid.setColumnStretch(1, 0)
-        self._grid.setColumnStretch(2, 4)
-        self._grid.setColumnStretch(3, 2)
+        self._grid.setColumnStretch(2, 0)
+        self._grid.setColumnStretch(3, 4)
         self._grid.setColumnStretch(4, 2)
         self._grid.setColumnStretch(5, 2)
         self._grid.setColumnStretch(6, 2)
+        self._grid.setColumnStretch(7, 2)
 
         # 表头
-        headers = ['CH', 'Show', 'Name', 'Color', 'Value', 'Type', 'Unit']
+        headers = ['CH', 'Show', 'Y联动', 'Name', 'Color', 'Value', 'Type', 'Unit']
         for col, h in enumerate(headers):
             lbl = QLabel(h)
             lbl.setStyleSheet("font-weight: bold; color: #AAAAAA;")
@@ -153,13 +156,20 @@ class ChannelConfigPanel(QWidget):
         self._grid.addWidget(cb_show, row, 1)
         widgets['visible'] = cb_show
 
+        cb_y_link = QCheckBox()
+        cb_y_link.setToolTip("勾选多个通道后，同步缩放/平移这些通道的Y轴")
+        cb_y_link.stateChanged.connect(
+            lambda state, idx=ch_idx: self._emit_y_link_channels_changed())
+        self._grid.addWidget(cb_y_link, row, 2)
+        widgets['y_link'] = cb_y_link
+
         # 名称
         name_edit = QLineEdit(f"CH{ch_idx + 1}")
         name_edit.setMinimumWidth(80)
         name_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         name_edit.textChanged.connect(
             lambda text, idx=ch_idx: self._on_changed(idx))
-        self._grid.addWidget(name_edit, row, 2)
+        self._grid.addWidget(name_edit, row, 3)
         widgets['name'] = name_edit
 
         # 颜色
@@ -171,7 +181,7 @@ class ChannelConfigPanel(QWidget):
             f"border: 1px solid #666; border-radius: 3px;")
         color_btn.clicked.connect(
             lambda checked, idx=ch_idx: self._pick_color(idx))
-        self._grid.addWidget(color_btn, row, 3)
+        self._grid.addWidget(color_btn, row, 4)
         widgets['color_btn'] = color_btn
         widgets['color'] = color
 
@@ -185,7 +195,7 @@ class ChannelConfigPanel(QWidget):
         type_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         type_combo.currentIndexChanged.connect(
             lambda idx_combo, idx=ch_idx: self._on_changed(idx))
-        self._grid.addWidget(type_combo, row, 5)
+        self._grid.addWidget(type_combo, row, 6)
         widgets['data_type'] = type_combo
 
         # 当前采集值
@@ -194,7 +204,7 @@ class ChannelConfigPanel(QWidget):
         value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         value_label.setStyleSheet(
             "font-family: Consolas, monospace; color: #DDDDDD;")
-        self._grid.addWidget(value_label, row, 4)
+        self._grid.addWidget(value_label, row, 5)
         widgets['value'] = value_label
 
         # 通道单位
@@ -204,7 +214,7 @@ class ChannelConfigPanel(QWidget):
         unit_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         unit_edit.textChanged.connect(
             lambda text, idx=ch_idx: self._on_changed(idx))
-        self._grid.addWidget(unit_edit, row, 6)
+        self._grid.addWidget(unit_edit, row, 7)
         widgets['unit'] = unit_edit
 
         self._apply_row_widget_metrics(widgets)
@@ -234,11 +244,12 @@ class ChannelConfigPanel(QWidget):
             value_label.setMinimumHeight(ROW_CONTROL_HEIGHT)
             value_label.setMaximumHeight(ROW_CONTROL_HEIGHT)
 
-        visible = widgets.get('visible')
-        if visible is not None:
-            visible.setFont(text_font)
-            visible.setMinimumHeight(ROW_CONTROL_HEIGHT)
-            visible.setMaximumHeight(ROW_CONTROL_HEIGHT)
+        for key in ('visible', 'y_link'):
+            checkbox = widgets.get(key)
+            if checkbox is not None:
+                checkbox.setFont(text_font)
+                checkbox.setMinimumHeight(ROW_CONTROL_HEIGHT)
+                checkbox.setMaximumHeight(ROW_CONTROL_HEIGHT)
 
     @staticmethod
     def _ch_btn_style(color, selected=False):
@@ -306,6 +317,7 @@ class ChannelConfigPanel(QWidget):
         self._num_channels += 1
         self._add_channel_row(ch_idx)
         self._update_channel_buttons()
+        self._emit_y_link_channels_changed()
         self.channel_count_changed.emit(self._num_channels)
         self.channel_changed.emit(ch_idx, self.get_channel_config(ch_idx))
 
@@ -329,6 +341,7 @@ class ChannelConfigPanel(QWidget):
             self._update_selected_styles()
 
         self._update_channel_buttons()
+        self._emit_y_link_channels_changed()
         self.channel_count_changed.emit(self._num_channels)
 
     def set_channel_count(self, count):
@@ -377,6 +390,15 @@ class ChannelConfigPanel(QWidget):
                 self._num_channels < self._max_channels)
         if self._btn_remove_channel is not None:
             self._btn_remove_channel.setEnabled(self._num_channels > 1)
+
+    def y_link_channels(self):
+        return [
+            i for i, w in enumerate(self._channel_widgets)
+            if w.get('y_link') is not None and w['y_link'].isChecked()
+        ]
+
+    def _emit_y_link_channels_changed(self):
+        self.y_link_channels_changed.emit(self.y_link_channels())
 
     def get_channel_config(self, ch_idx):
         if 0 <= ch_idx < len(self._channel_widgets):
@@ -440,4 +462,7 @@ class ChannelConfigPanel(QWidget):
                 max(0, w['data_type'].findData(default_type)))
             w['unit'].clear()
             w['value'].setText("--")
+            if w.get('y_link') is not None:
+                w['y_link'].setChecked(False)
             self._on_changed(i)
+        self._emit_y_link_channels_changed()

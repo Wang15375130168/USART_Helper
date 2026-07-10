@@ -438,6 +438,8 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._needs_initial_range = True
         self._auto_x_range_update = False
         self._follow_latest_x = True
+        self._linked_y_channels = set()
+        self._syncing_linked_y_ranges = False
         self._channel_click_hit_px = 16.0
 
         self._setup_ui()
@@ -1133,9 +1135,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             self._expand_y_range_for_value(i, value)
         self._dirty = True
 
-    def add_data_points(self, frames):
+    def add_data_points(self, frames, ignore_pause=False):
         """Append decoded frames in batches; drawing still happens on timer."""
-        if self._paused or not frames:
+        if (self._paused and not ignore_pause) or not frames:
             return
 
         self._ensure_buffer_capacity(self._time_counter + len(frames))
@@ -1336,7 +1338,11 @@ class MultiChannelWaveform(QtWidgets.QWidget):
 
     def _on_main_y_range_changed(self, viewbox, range_info):
         if 0 <= self._selected_channel < len(self._channel_y_ranges):
-            self._channel_y_ranges[self._selected_channel] = tuple(range_info)
+            old_range = self._channel_y_ranges[self._selected_channel]
+            new_range = tuple(range_info)
+            self._channel_y_ranges[self._selected_channel] = new_range
+            self._sync_linked_y_ranges(
+                self._selected_channel, old_range, new_range)
         self._update_cursor_info()
         self._update_trigger_marker_position()
 
@@ -1344,6 +1350,99 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         if 0 <= ch < len(self._channel_y_ranges):
             self._channel_y_ranges[ch] = tuple(range_info)
         self._update_trigger_marker_position()
+
+    @staticmethod
+    def _valid_range(y_range):
+        if y_range is None or len(y_range) != 2:
+            return False
+        return math.isfinite(y_range[0]) and math.isfinite(y_range[1])
+
+    @staticmethod
+    def _ranges_close(first, second):
+        if not MultiChannelWaveform._valid_range(first):
+            return False
+        if not MultiChannelWaveform._valid_range(second):
+            return False
+        span = max(abs(first[1] - first[0]), abs(second[1] - second[0]), 1.0)
+        return (
+            abs(first[0] - second[0]) <= span * 1e-9 and
+            abs(first[1] - second[1]) <= span * 1e-9)
+
+    def _data_y_range_for_channel(self, ch):
+        if not (0 <= ch < len(self._buffers)):
+            return None
+        buf = self._buffers[ch]
+        if not buf:
+            return None
+        y = np.asarray(buf, dtype=np.float64)
+        y = y[np.isfinite(y)]
+        if y.size == 0:
+            return None
+        y_min, y_max = float(np.min(y)), float(np.max(y))
+        margin = max((y_max - y_min) * 0.05, 1.0)
+        return y_min - margin, y_max + margin
+
+    def _current_y_range_for_channel(self, ch):
+        if not (0 <= ch < len(self._channel_y_ranges)):
+            return None
+        y_range = self._channel_y_ranges[ch]
+        if self._valid_range(y_range):
+            return tuple(y_range)
+        y_range = self._data_y_range_for_channel(ch)
+        if y_range is not None:
+            self._channel_y_ranges[ch] = y_range
+        return y_range
+
+    def _sync_linked_y_ranges(self, source_ch, old_range, new_range):
+        if self._syncing_linked_y_ranges:
+            return
+        if source_ch not in self._linked_y_channels:
+            return
+        if self._ranges_close(old_range, new_range):
+            return
+        if not self._valid_range(old_range) or not self._valid_range(new_range):
+            return
+
+        old_span = float(old_range[1] - old_range[0])
+        new_span = float(new_range[1] - new_range[0])
+        if old_span <= 0 or new_span <= 0:
+            return
+
+        scale = new_span / old_span
+        old_center = (float(old_range[0]) + float(old_range[1])) / 2.0
+        new_center = (float(new_range[0]) + float(new_range[1])) / 2.0
+        shift_ratio = (new_center - old_center) / old_span
+        targets = [
+            ch for ch in sorted(self._linked_y_channels)
+            if ch != source_ch and 0 <= ch < self._num_channels
+        ]
+        if not targets:
+            return
+
+        self._syncing_linked_y_ranges = True
+        try:
+            for ch in targets:
+                target_range = self._current_y_range_for_channel(ch)
+                if not self._valid_range(target_range):
+                    continue
+                target_span = float(target_range[1] - target_range[0])
+                if target_span <= 0:
+                    continue
+                target_center = (
+                    float(target_range[0]) + float(target_range[1])) / 2.0
+                synced_span = max(target_span * scale, 1e-12)
+                synced_center = target_center + shift_ratio * target_span
+                synced_range = (
+                    synced_center - synced_span / 2.0,
+                    synced_center + synced_span / 2.0)
+                self._channel_y_ranges[ch] = synced_range
+                view_box = (
+                    self._main_view_box if ch == self._selected_channel
+                    else self._channel_view_boxes[ch])
+                view_box.setYRange(
+                    synced_range[0], synced_range[1], padding=0)
+        finally:
+            self._syncing_linked_y_ranges = False
 
     @staticmethod
     def _data_offset_for_screen_pixels(view_box, dx_px=0.0, dy_up_px=0.0):
@@ -1446,6 +1545,8 @@ class MultiChannelWaveform(QtWidgets.QWidget):
                 self._combo_y_ch.removeItem(ch_idx)
             self._num_channels = count
             self._active_channel_count = min(self._active_channel_count, count)
+            self._linked_y_channels = {
+                ch for ch in self._linked_y_channels if ch < count}
 
             if self._selected_channel >= count:
                 self._selected_channel = count - 1
@@ -1504,7 +1605,7 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self.clear_data()
         self.set_follow_latest_enabled(True)
         if frames:
-            self.add_data_points(frames)
+            self.add_data_points(frames, ignore_pause=True)
             self._on_refresh_tick()
             self._set_full_data_x_range()
             self._auto_range_all_channels()
@@ -1945,6 +2046,20 @@ class MultiChannelWaveform(QtWidgets.QWidget):
     def set_follow_latest_enabled(self, enabled):
         self._follow_latest_x = bool(enabled)
         self._dirty = True
+
+    def set_y_link_channels(self, channels):
+        linked = set()
+        for ch in channels or []:
+            try:
+                ch = int(ch)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= ch < self._num_channels:
+                linked.add(ch)
+        self._linked_y_channels = linked
+
+    def y_link_channels(self):
+        return sorted(self._linked_y_channels)
 
     def _trigger_marker_channel_index(self):
         if self._trigger_marker_channel is None:
