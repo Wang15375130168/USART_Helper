@@ -1,8 +1,8 @@
 """多通道波形显示组件
 
 核心设计:
-  - 共享X轴(时间), 各通道独立Y轴
-  - 各通道Y轴独立缩放, 互不影响
+  - 共享X轴(时间), Y联动通道共享同一绝对Y轴范围
+  - 未联动通道保留独立Y轴缩放范围
   - X轴缩放/平移时所有通道同步
   - 只显示当前选中通道的Y轴, 其他通道曲线可见但无Y轴
   - 游标卡尺功能(双竖线测量)
@@ -938,7 +938,11 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         """让所有叠加 ViewBox 与主绘图区完全重合。"""
         if self._main_view_box is None:
             return
-        rect = self._main_view_box.sceneBoundingRect()
+        # sceneBoundingRect() 会把主 ViewBox 的边框笔宽也算进去（通常多
+        # 0.5 px）。再把这个矩形设置给无边框叠加层，会令叠加层实际比主层
+        # 宽/高 0.5 px，产生细小但真实的通道斜率差。geometry() 才是绘图区
+        # 的精确布局矩形；主 ViewBox 与叠加层都直接位于 scene 中。
+        rect = self._main_view_box.geometry()
         for vb in self._channel_view_boxes:
             vb.setGeometry(rect)
             vb.linkedViewChanged(self._main_view_box, vb.XAxis)
@@ -1192,6 +1196,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         margin = max(span * 0.05, 1.0)
         new_min = min(y_min, value_min - margin)
         new_max = max(y_max, value_max + margin)
+        if ch in self._linked_y_channels:
+            self._set_linked_y_range(ch, (new_min, new_max))
+            return
         self._channel_y_ranges[ch] = (new_min, new_max)
 
         vb = (self._main_view_box if ch == self._selected_channel
@@ -1211,6 +1218,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         margin = max(span * 0.05, 1.0)
         new_min = min(y_min, value - margin)
         new_max = max(y_max, value + margin)
+        if ch in self._linked_y_channels:
+            self._set_linked_y_range(ch, (new_min, new_max))
+            return
         self._channel_y_ranges[ch] = (new_min, new_max)
 
         vb = (self._main_view_box if ch == self._selected_channel
@@ -1403,15 +1413,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         if not self._valid_range(old_range) or not self._valid_range(new_range):
             return
 
-        old_span = float(old_range[1] - old_range[0])
         new_span = float(new_range[1] - new_range[0])
-        if old_span <= 0 or new_span <= 0:
+        if new_span <= 0:
             return
-
-        scale = new_span / old_span
-        old_center = (float(old_range[0]) + float(old_range[1])) / 2.0
-        new_center = (float(new_range[0]) + float(new_range[1])) / 2.0
-        shift_ratio = (new_center - old_center) / old_span
         targets = [
             ch for ch in sorted(self._linked_y_channels)
             if ch != source_ch and 0 <= ch < self._num_channels
@@ -1422,19 +1426,9 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         self._syncing_linked_y_ranges = True
         try:
             for ch in targets:
-                target_range = self._current_y_range_for_channel(ch)
-                if not self._valid_range(target_range):
-                    continue
-                target_span = float(target_range[1] - target_range[0])
-                if target_span <= 0:
-                    continue
-                target_center = (
-                    float(target_range[0]) + float(target_range[1])) / 2.0
-                synced_span = max(target_span * scale, 1e-12)
-                synced_center = target_center + shift_ratio * target_span
-                synced_range = (
-                    synced_center - synced_span / 2.0,
-                    synced_center + synced_span / 2.0)
+                # 必须复制绝对范围，而不是按各通道原跨度做比例变换。
+                # 只有相同的原点和单位/像素比例，常量差波形才会保持平行。
+                synced_range = tuple(new_range)
                 self._channel_y_ranges[ch] = synced_range
                 view_box = (
                     self._main_view_box if ch == self._selected_channel
@@ -1994,6 +1988,25 @@ class MultiChannelWaveform(QtWidgets.QWidget):
 
     def _auto_range_channel(self, ch):
         """按单个通道数据设置该通道自己的Y范围。"""
+        if ch in self._linked_y_channels:
+            linked_with_data = [
+                linked_ch for linked_ch in sorted(self._linked_y_channels)
+                if 0 <= linked_ch < self._active_channel_count
+                and self._channel_configs[linked_ch]['visible']
+                and self._buffers[linked_ch]
+            ]
+            if linked_with_data:
+                ranges = [
+                    self._data_y_range_for_channel(linked_ch)
+                    for linked_ch in linked_with_data
+                ]
+                ranges = [r for r in ranges if self._valid_range(r)]
+                if ranges:
+                    y_min = min(r[0] for r in ranges)
+                    y_max = max(r[1] for r in ranges)
+                    self._set_linked_y_range(ch, (y_min, y_max))
+                    return
+
         buf = self._buffers[ch]
         if len(buf) == 0:
             return
@@ -2010,7 +2023,12 @@ class MultiChannelWaveform(QtWidgets.QWidget):
         vb.setYRange(y_min - margin, y_max + margin, padding=0)
 
     def _auto_range_all_channels(self):
+        handled_linked = False
         for ch in range(self._num_channels):
+            if ch in self._linked_y_channels:
+                if handled_linked:
+                    continue
+                handled_linked = True
             self._auto_range_channel(ch)
 
     def _auto_range_all(self):
@@ -2057,6 +2075,44 @@ class MultiChannelWaveform(QtWidgets.QWidget):
             if 0 <= ch < self._num_channels:
                 linked.add(ch)
         self._linked_y_channels = linked
+        if len(linked) < 2:
+            return
+
+        ranges = [
+            self._data_y_range_for_channel(ch)
+            for ch in sorted(linked)
+            if ch < self._active_channel_count
+            and self._channel_configs[ch]['visible']
+        ]
+        ranges = [r for r in ranges if self._valid_range(r)]
+        if ranges:
+            self._set_linked_y_range(
+                min(linked),
+                (min(r[0] for r in ranges), max(r[1] for r in ranges)))
+
+    def _set_linked_y_range(self, source_ch, y_range):
+        """Apply one absolute Y coordinate system to every linked channel."""
+        if not self._valid_range(y_range) or y_range[1] <= y_range[0]:
+            return
+        targets = [
+            ch for ch in sorted(self._linked_y_channels)
+            if 0 <= ch < self._num_channels
+        ]
+        if source_ch not in targets:
+            targets.append(source_ch)
+
+        self._syncing_linked_y_ranges = True
+        try:
+            for ch in targets:
+                synced_range = tuple(y_range)
+                self._channel_y_ranges[ch] = synced_range
+                view_box = (
+                    self._main_view_box if ch == self._selected_channel
+                    else self._channel_view_boxes[ch])
+                view_box.setYRange(
+                    synced_range[0], synced_range[1], padding=0)
+        finally:
+            self._syncing_linked_y_ranges = False
 
     def y_link_channels(self):
         return sorted(self._linked_y_channels)

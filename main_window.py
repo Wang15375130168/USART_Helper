@@ -503,6 +503,8 @@ class MainWindow(QMainWindow):
             self._waveform.select_channel)
         self._channel_config.y_link_channels_changed.connect(
             self._waveform.set_y_link_channels)
+        self._waveform.set_y_link_channels(
+            self._channel_config.y_link_channels())
         self._waveform.buffer_size_changed.connect(
             self._on_buffer_size_changed)
         self._waveform._btn_clear.clicked.connect(
@@ -1562,6 +1564,8 @@ class MainWindow(QMainWindow):
             self._waveform.set_channel_color(ch_idx, config['color'])
             self._waveform.set_channel_visible(ch_idx, config['visible'])
             self._waveform.set_channel_unit(ch_idx, config.get('unit', ''))
+        self._waveform.set_y_link_channels(
+            self._channel_config.y_link_channels())
 
         self._sync_parser_channel_types()
         self._refresh_trigger_channel_combo(count)

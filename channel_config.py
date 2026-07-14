@@ -157,7 +157,13 @@ class ChannelConfigPanel(QWidget):
         widgets['visible'] = cb_show
 
         cb_y_link = QCheckBox()
-        cb_y_link.setToolTip("勾选多个通道后，同步缩放/平移这些通道的Y轴")
+        # 同一组位置/反馈量必须使用相同的绝对 Y 坐标，否则相同的数值增量
+        # 会因为各通道自动范围不同而显示成不同斜率。默认将通道放在同一组；
+        # 不同单位或量纲的通道仍可由用户取消联动。
+        cb_y_link.setChecked(True)
+        cb_y_link.setToolTip(
+            "勾选多个通道后，共享同一个绝对Y轴范围；"
+            "数值差相同的波形会保持平行")
         cb_y_link.stateChanged.connect(
             lambda state, idx=ch_idx: self._emit_y_link_channels_changed())
         self._grid.addWidget(cb_y_link, row, 2)
@@ -463,6 +469,6 @@ class ChannelConfigPanel(QWidget):
             w['unit'].clear()
             w['value'].setText("--")
             if w.get('y_link') is not None:
-                w['y_link'].setChecked(False)
+                w['y_link'].setChecked(True)
             self._on_changed(i)
         self._emit_y_link_channels_changed()
