@@ -783,6 +783,15 @@ class MainWindow(QMainWindow):
                 continue
 
             value = float(frame[source_ch])
+
+            # 先完整填充预触发区，再开始判断条件。否则刚布防时遇到阈值
+            # 上方的数据会立刻触发，既没有配置要求的预触发历史，也容易
+            # 从波形峰值/下降段开始截取，导致完整的锯齿（三角形）被切碎。
+            if len(self._trigger_pre_buffer) < self._trigger_pre_samples:
+                self._trigger_pre_buffer.append(frame)
+                self._trigger_prev_value = value
+                continue
+
             if self._trigger_condition_met(self._trigger_prev_value, value):
                 self._trigger_capturing = True
                 self._trigger_armed = False
@@ -869,11 +878,17 @@ class MainWindow(QMainWindow):
         mode = self._trigger_mode()
 
         if mode == "level":
-            return current >= threshold
+            # 电平触发只比较当前采样点是否等于阈值。浮点采样按阈值输入框
+            # 的显示精度比较；例如显示 30000.000 时，落在半个末位以内的
+            # 值视为相等。整数采样在这个容差下仍等价于精确相等。
+            decimals = self._spin_trigger_threshold.decimals()
+            tolerance = 0.5 * (10.0 ** -decimals)
+            return math.isclose(
+                current, threshold, rel_tol=0.0, abs_tol=tolerance)
+
+        # 上升沿和下降沿必须同时有前后两个样本，才能证明发生阈值穿越。
         if previous is None:
-            if mode == "falling":
-                return current <= threshold
-            return current >= threshold
+            return False
         if mode == "falling":
             return previous > threshold >= current
         return previous < threshold <= current
